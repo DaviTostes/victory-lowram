@@ -43,7 +43,6 @@ use crate::host::{HostList, host, transition};
 pub(crate) mod batch;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -57,10 +56,10 @@ cbuffer Record : register(b0) {
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
@@ -77,7 +76,6 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
@@ -89,7 +87,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = id.x * (stride / 4);
     uint cost = 0;
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
@@ -161,8 +159,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // (`rest`).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
+        InterlockedOr(budget[0], 0, before);
         while (before < BUDGET) {
             uint next = before;
             for (uint j = 0; j < n; j++) {
@@ -173,7 +170,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             }
             if (next == before) break;
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) break;
             before = prev;
         }
@@ -195,17 +192,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // the largest cost there was (small ones are not told).
         uint told;
         if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
+            InterlockedAdd(budget[3], refused, told);
         }
         if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            InterlockedMax(budget[4], biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0 && kind > 2 && n > 0) {
         uint was;
-        budget.InterlockedMax(4, largest_asked, was);
-        budget.InterlockedAdd(8, all_asked, was);
+        InterlockedMax(budget[1], largest_asked, was);
+        InterlockedAdd(budget[2], all_asked, was);
     }
     if (!active) {
         return;
@@ -215,15 +212,18 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args[dst_at] = draw_counts.x;
+        dst_args[dst_at + 1] = draw_counts.y;
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
+        dst_args[dst_at] = groups.x;
+        dst_args[dst_at + 1] = groups.y;
+        dst_args[dst_at + 2] = groups.z;
         for (uint off = 12; off < stride; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
@@ -305,6 +305,18 @@ fn rest() -> u32 {
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::{root_constants, root_view};
+    let params = [
+        root_constants(0, 6),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+    ];
+    crate::host::root_signature(device, &params, "argument clamp")
+}
+
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
@@ -345,7 +357,7 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root = root_signature(device)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
