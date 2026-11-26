@@ -284,6 +284,26 @@ impl Drop for Call {
     }
 }
 
+/// Summary of pipeline library calls currently in flight (for diagnosing stuck workers).
+pub(crate) fn active_calls() -> String {
+    use std::fmt::Write;
+    let now = crate::host::now_us();
+    let calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+    if calls.is_empty() {
+        return "none".into();
+    }
+    let mut text = String::new();
+    for (i, (thread, what, name, since)) in calls.iter().enumerate() {
+        let _ = write!(
+            text,
+            "{}{what} {name} ({:.0}ms, t={thread})",
+            if i == 0 { "" } else { "; " },
+            now.saturating_sub(*since) as f64 / 1000.0
+        );
+    }
+    text
+}
+
 /// For the report when the host device is removed: the library calls
 /// running at that moment, whether this run replaced the mapped file and
 /// let its pages go, and how many pages of the mapping read as zeros now.

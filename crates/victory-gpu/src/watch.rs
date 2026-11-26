@@ -1573,7 +1573,8 @@ impl Guards {
     fn opened(&mut self, block: usize) {
         const MANY: usize = 1 << 13;
         if self.opened.len() >= MANY {
-            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            let keep_ms = rest().as_millis().max(50);
+            self.opened.retain(|_, at| at.elapsed().as_millis() < keep_ms);
             if self.opened.len() >= MANY {
                 self.opened.clear();
             }

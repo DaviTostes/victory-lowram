@@ -41,6 +41,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Timed out once in [`wait`] while still being made: do not stall every
+    /// subsequent frame on the same slow/stuck pipeline while workers finish it.
+    timed_out: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
 }
@@ -68,6 +71,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
         }
     }
 
@@ -159,6 +163,10 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    if super::skipped_shaders(&p.shaders).is_some() {
+        let _ = p.made.set(None);
+        return None;
+    }
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -166,7 +174,18 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if !p.timed_out.load(Ordering::Relaxed) && wait(p, crate::frame::current()) {
+            if !p.timed_out.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    key = %p.key,
+                    screen = p.screen,
+                    shaders = ?p.shaders,
+                    waiting = waiting(),
+                    active = %super::library::active_calls(),
+                    "pipeline still being made after wait budget; stopped blocking later frames for it"
+                );
+            }
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -181,6 +200,10 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    if super::skipped_shaders(&p.shaders).is_some() {
+        let _ = p.made.set(None);
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
@@ -200,12 +223,14 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+/// Waits for `p` while frame `frame` has budget left. Returns `true` if it
+/// waited meaningfully (>= 100 ms) and `p` was still not ready when the budget
+/// expired.
+fn wait(p: &Pending, frame: u64) -> bool {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
-        return;
+        return false;
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
@@ -224,7 +249,7 @@ fn wait(p: &Pending, frame: u64) {
         left
     };
     if left.is_zero() {
-        return;
+        return false;
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -262,6 +287,7 @@ fn wait(p: &Pending, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+    p.made.get().is_none() && left >= Duration::from_millis(100)
 }
 
 const NOT_QUEUED: u8 = 0;

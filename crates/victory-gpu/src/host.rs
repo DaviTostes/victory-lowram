@@ -152,13 +152,17 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     if budget == 0 {
         return (IDLE_MS, u64::MAX);
     }
+    let room = crate::resource::room_percent();
+    let hi = room.saturating_sub(2).max(50);
+    let lo = room.saturating_sub(5).max(45);
+    let urgent = (room + 5).min(97);
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(hi) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(urgent) {
+        (IDLE_MS, used - share(lo))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(lo))
     }
 }
 
