@@ -218,7 +218,7 @@ RWStructuredBuffer<float4> cells : register(u1);
 RWStructuredBuffer<float4> points : register(u2);
 // For the light probe (`crate::lightprobe`): sampled pixels, and the sums of
 // what the title's resolve left, what was found and what was written.
-RWByteAddressBuffer stats : register(u3);
+RWStructuredBuffer<uint> stats : register(u3);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
@@ -408,10 +408,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
-        stats.InterlockedAdd(0, 1, ignored);
-        stats.InterlockedAdd(4, uint(min(left, 1000.0) * 256.0), ignored);
-        stats.InterlockedAdd(8, uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
-        stats.InterlockedAdd(12, uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[0], 1, ignored);
+        InterlockedAdd(stats[1], uint(min(left, 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[2], uint(min(dot(found, LUMA), 1000.0) * 256.0), ignored);
+        InterlockedAdd(stats[3], uint(min(dot(written, LUMA), 1000.0) * 256.0), ignored);
     }
 }
 #endif
