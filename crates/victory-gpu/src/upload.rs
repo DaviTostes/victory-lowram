@@ -84,7 +84,12 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
             1,
         )
     } as usize;
-    (at != 0).then_some(at)
+    if at != 0 {
+        crate::watch::title_memory_watched(at, len);
+        Some(at)
+    } else {
+        None
+    }
 }
 
 impl Upload {

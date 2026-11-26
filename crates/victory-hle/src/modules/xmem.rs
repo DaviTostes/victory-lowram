@@ -177,8 +177,15 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
-    if !at.is_null() && !placeholder {
-        victory_gpu::title_memory_allocated(at as usize, size);
+    if !at.is_null() {
+        if placeholder && base.is_null() {
+            victory_gpu::title_memory_placeholder(at as usize, size);
+        } else if !placeholder {
+            victory_gpu::title_memory_allocated(at as usize, size);
+            if kind & MEM_WRITE_WATCH != 0 {
+                victory_gpu::title_memory_watched(at as usize, size);
+            }
+        }
     }
     note_protection(asked, kind, flags, at as usize, size);
     at
