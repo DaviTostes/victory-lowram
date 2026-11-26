@@ -318,9 +318,12 @@ fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSign
 }
 
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    #[cfg(feature = "diagnostics")]
-    let batched = source == batch::SOURCE;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    make_with(device, source, root_signature(device)?)
+}
+
+/// `source` compiled and made with `root`.
+fn make_with(device: &ID3D12Device, source: &str, root: ID3D12RootSignature) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -357,7 +360,6 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root = root_signature(device)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -566,11 +568,28 @@ fn record_clamp_as(
 }
 
 /// The batched clamp's pipeline ([`batch`]).
+fn batch_root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    use crate::host::root_view;
+    let params = [
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 1),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 2),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 3),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 4),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+    ];
+    crate::host::root_signature(device, &params, "argument clamp batch")
+}
+
 fn batch_clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
         .get_or_init(|| {
-            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE));
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| {
+                let source = format!("#define WIDEST {}u\n#define REST {}\n{}", widest(amd(&h.device)), rest(), batch::SOURCE);
+                make_with(&h.device, &source, batch_root_signature(&h.device)?)
+            });
             match made {
                 Ok(c) => Some(c),
                 Err(e) => {
