@@ -128,7 +128,6 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -157,7 +156,6 @@ float3 seen(int2 p, float2 size) {
 
 #ifdef KEEP
 RWTexture2D<float3> radiance : register(u0);
-[RootSignature(RS)]
 [numthreads(8, 4, 1)]
 void keep(uint3 at : SV_DispatchThreadID) {
     uint w, h;
@@ -172,7 +170,6 @@ void keep(uint3 at : SV_DispatchThreadID) {
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void mean() {
     float3 sum = 0;
@@ -184,7 +181,6 @@ void mean() {
 #endif
 
 #ifdef PLACE
-[RootSignature(RS)]
 [numthreads(8, 4, 1)]
 void place(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
@@ -194,7 +190,6 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
-[RootSignature(RS)]
 [numthreads(8, 2, 1)]
 void gather(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
@@ -231,7 +226,6 @@ RWTexture3D<float3> scattered : register(u0);
 // No more than a multiple of the light around: of the room as the last
 // seconds showed it, and of the surface seen in this direction (towards a
 // window the air outside may be as bright as the sky is).
-[RootSignature(RS)]
 [numthreads(8, 8, 2)]
 void clear_air(uint3 at : SV_DispatchThreadID) {
     uint w, h, d;
@@ -262,7 +256,6 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
@@ -353,14 +346,44 @@ unsafe impl Send for Pass {}
 unsafe impl Sync for Pass {}
 
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
-    let mut root: Option<ID3D12RootSignature> = None;
-    let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
+    let srv_range = D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let uav_range = D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    let table = |r: &D3D12_DESCRIPTOR_RANGE1| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: r,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let params = [
+        crate::host::root_constants(0, 12),
+        table(&srv_range),
+        table(&uav_range),
+        crate::host::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+        crate::host::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 2),
+    ];
+    let root = crate::host::root_signature(device, &params, "ambient")?;
+    let pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
-        // SAFETY: the root signature is inside the shader; plain creations.
+        // SAFETY: plain creation pointing at live root and bytecode.
         unsafe {
-            if root.is_none() {
-                root = Some(device.CreateRootSignature(0, &code)?);
-            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
@@ -377,7 +400,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let air = pipeline("AIR", s!("clear_air"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
-        root: root.ok_or_else(windows::core::Error::empty)?,
+        root,
         keep,
         mean,
         place,
