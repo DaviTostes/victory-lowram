@@ -61,16 +61,14 @@ pub(crate) fn words_under() -> bool {
 }
 
 const SCATTER: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
 cbuffer Part : register(b0) { uint at; uint count; };
 ByteAddressBuffer pairs : register(t0);
-RWByteAddressBuffer card : register(u0);
-[RootSignature(RS)]
+RWStructuredBuffer<uint> card : register(u0);
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= count) return;
     uint2 p = pairs.Load2(at + id.x * 8u);
-    card.Store(p.x, p.y);
+    card[p.x / 4u] = p.y;
 }
 "#;
 
@@ -83,10 +81,14 @@ fn pass(host: &Host) -> Option<&'static Pass> {
     static PASS: OnceLock<Option<Pass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).ok()?;
-        // SAFETY: the code lives through the calls; the root signature is
-        // inside it.
+        let params = [
+            super::root_constants(0, 2),
+            super::root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+            super::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+        ];
+        let root: ID3D12RootSignature = super::root_signature(&host.device, &params, "scatter").ok()?;
+        // SAFETY: the code lives through the calls.
         unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).ok()?;
             let pso: ID3D12PipelineState = host
                 .device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {

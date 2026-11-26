@@ -1100,6 +1100,11 @@ fn placeholder(block: usize) -> bool {
     // (Class 3 answers with the kind of memory in that word, not the flags.)
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
     const PLACEHOLDER_RESERVATION: u32 = 1 << 8;
+    const STATUS_INVALID_INFO_CLASS: i32 = 0xC000_0003_u32 as i32;
+    static UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if UNSUPPORTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     let mut region = Region::default();
     // SAFETY: the answer's room and its size.
     let status = unsafe {
@@ -1112,6 +1117,10 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
+    if status == STATUS_INVALID_INFO_CLASS {
+        UNSUPPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
     status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
 }
 

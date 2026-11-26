@@ -2100,7 +2100,6 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// 82 on the card (capture replay1, 405 of them), most of it waiting for
 /// those steps.
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -2112,10 +2111,9 @@ cbuffer Span : register(b0) {
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
-RWByteAddressBuffer hashes : register(u0);
-RWByteAddressBuffer differs : register(u1);
+RWStructuredBuffer<uint> hashes : register(u0);
+RWStructuredBuffer<uint> differs : register(u1);
 groupshared uint4 parts[64];
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     uint piece = first + id.x;
@@ -2168,15 +2166,25 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
         h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
+    uint hp = piece * 4u;
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
-        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+        uint4 prev = uint4(hashes[hp], hashes[hp + 1u], hashes[hp + 2u], hashes[hp + 3u]);
+        differs[out_at / 4u + id.x] = (folded << 1u) | (any(h != prev) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) {
+            hashes[hp] = h.x;
+            hashes[hp + 1u] = h.y;
+            hashes[hp + 2u] = h.z;
+            hashes[hp + 3u] = h.w;
+        }
     } else {
-        hashes.Store4(piece * 16u, h);
+        hashes[hp] = h.x;
+        hashes[hp + 1u] = h.y;
+        hashes[hp + 2u] = h.z;
+        hashes[hp + 3u] = h.w;
     }
 }
 "#;
@@ -4265,11 +4273,16 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        let root_params = [
+            root_constants(0, 6),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1),
+        ];
+        let root: ID3D12RootSignature = root_signature(&self.device, &root_params, "card compare")?;
+        // SAFETY: the blob's own bytes.
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
