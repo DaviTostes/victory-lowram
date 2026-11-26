@@ -2878,8 +2878,32 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+    });
+    if settle_room() { most.saturating_mul(2) } else { most }
+}
+
+/// Whether flights get twice the room before "lists in the air" settles them
+/// ([`late_most`]) and eight times the changed runs before the merge under
+/// shaders' writes gives up and settles them ([`merge_runs_limit`],
+/// `VICTORY_SETTLE_ROOM=1`; off by default).
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_ROOM").is_some_and(|v| v == "1"))
+}
+
+/// Maximum changed runs merged into card memory under active shader writes
+/// before settling flights (`VICTORY_MERGE_RUNS`; defaults to 4096 with
+/// `VICTORY_CARD_STEPS` or `VICTORY_SETTLE_ROOM=1`, else 512).
+fn merge_runs_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_MERGE_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or_else(|| if card_steps::stage() > 0 || settle_room() { 4096 } else { 512 })
     })
 }
 
@@ -3355,7 +3379,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = merge_runs_limit();
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;

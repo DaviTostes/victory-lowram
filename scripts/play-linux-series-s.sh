@@ -1,0 +1,109 @@
+#!/usr/bin/env sh
+# Portable Linux/Wine launcher for victory-lowram — Xbox Series S profile
+# Lowest system RAM + VRAM usage and highest frame rate on 16 GB RAM / 16 GB VRAM GPUs.
+#
+# Required environment variables (or edit defaults below):
+#   VICTORY_GAME_LINUX_DIR   Linux path containing game.exe (default: $HOME/Games/GTAVI)
+#   VICTORY_RUNTIME_DIR      Linux path for data/ and cache/ (default: $HOME/Games/GTAVI-runtime)
+#   WINEPREFIX               Wine prefix with vkd3d-proton installed (default: $HOME/.wine-gta)
+#   WINE                     Wine binary (default: wine)
+#
+# Recommended host sysctl for 3x faster Wine GetWriteWatch (kernel userfaultfd + PAGEMAP_SCAN):
+#   sudo sysctl -w vm.unprivileged_userfaultfd=1
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+
+WINE="${WINE:-wine}"
+VICTORY="${VICTORY_BIN:-$REPO_ROOT/target/x86_64-pc-windows-msvc/release/victory.exe}"
+GAME_LINUX_DIR="${VICTORY_GAME_LINUX_DIR:-$HOME/Games/GTAVI}"
+RUNTIME_DIR="${VICTORY_RUNTIME_DIR:-$HOME/Games/GTAVI-runtime}"
+
+to_wine_path() {
+    printf 'Z:%s' "$1" | sed 's|/|\\|g'
+}
+
+export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-gta}"
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-d3d12,d3d12core,dxgi=n}"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export VICTORY_DATA_DIR="${VICTORY_DATA_DIR:-$(to_wine_path "$RUNTIME_DIR/data")}"
+export VICTORY_CACHE_DIR="${VICTORY_CACHE_DIR:-$(to_wine_path "$RUNTIME_DIR/cache")}"
+export VICTORY_GAME_DIR="${VICTORY_GAME_DIR:-$(to_wine_path "$GAME_LINUX_DIR")}"
+export VICTORY_DISPLAY_MODE="${VICTORY_DISPLAY_MODE:-1920x1080}"
+export VICTORY_OUTPUT="${VICTORY_OUTPUT:-1920x1080}"
+export VICTORY_WAIT_RESIDENT="${VICTORY_WAIT_RESIDENT:-0}"
+
+# Renderer patches verified fast and safe on Wine + vkd3d-proton
+export VICTORY_PORT_DESCRIPTORS="${VICTORY_PORT_DESCRIPTORS:-0}"
+export VICTORY_PORT_CBV="${VICTORY_PORT_CBV:-0}"
+export VICTORY_PORT_GUARD="${VICTORY_PORT_GUARD:-1}"
+export VICTORY_PORT_JOURNAL="${VICTORY_PORT_JOURNAL:-1}"
+export VICTORY_SETTLE_ROOM="${VICTORY_SETTLE_ROOM:-1}"
+
+# Fast submission, relay, and texture upload pipeline
+export VICTORY_TEXTURE_NO_WAIT=1
+export VICTORY_RELAY=2
+export VICTORY_WIDE_BACK=1
+export VICTORY_CARD_REHASH_RUNS=1
+export VICTORY_JOIN_COPIES=1
+export VICTORY_INDIRECT_WINDOW=1
+export VICTORY_RELAY_COPY=1
+export VICTORY_CARD_STEPS=2
+export VICTORY_INDIRECT_BATCH=2
+export VICTORY_MAP_THREADS=1
+export VICTORY_TITLE_PRIORITIES=0
+export VICTORY_THIN=1
+export VICTORY_JOIN_PARTS="${VICTORY_JOIN_PARTS:-8}"
+export VICTORY_JOIN_LISTS="${VICTORY_JOIN_LISTS:-64}"
+export VICTORY_UPLOAD_AHEAD=1
+export VICTORY_SHOW_AFTER=1
+export VICTORY_CARD_AWAKE=1
+export VICTORY_LAND_ECHO=1
+export VICTORY_UNDER_WIDE=1
+
+# Indirect light stand-in (Wine FXC compatible + RDNA4 magenta probe filter)
+export VICTORY_AMBIENT="${VICTORY_AMBIENT:-0.80}"
+export VICTORY_LEVELS_ON_DEMAND=1
+
+# Wine write-watch / VirtualProtect tuning
+export VICTORY_INPLACE="${VICTORY_INPLACE:-1}"
+export VICTORY_INPLACE_MB="${VICTORY_INPLACE_MB:-2048}"
+export VICTORY_TEXTURE_GUARD=1
+export VICTORY_GUARD_REST="${VICTORY_GUARD_REST:-3000}"
+export VICTORY_AHEAD_GAP_KB="${VICTORY_AHEAD_GAP_KB:-32768}"
+export VICTORY_COPY_BESIDE=1
+export VICTORY_STORE_BESIDE=1
+if [ -z "${VICTORY_WRITE_SITES:-}" ] && [ -f "$RUNTIME_DIR/cache/write-sites.txt" ]; then
+    export VICTORY_WRITE_SITES="$(to_wine_path "$RUNTIME_DIR/cache/write-sites.txt")"
+fi
+# Compute shaders known to deadlock in vkd3d-proton CreateComputePipelineState
+export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES:-32ed072b9f845048,a1b20bc47e3c9597,17829ac71aab4e8d,afeea48bbb9913ad,e8c962358d862e3f,559d9f0184e15fe3}"
+
+# Low-RAM (16 GB host) pool caps
+export VICTORY_KEEP_FREED=0
+export VICTORY_LIST_POOL_MAX=24
+export VICTORY_LIST_POOL_MB=32
+export VICTORY_SPARE_MB=32
+export VICTORY_SNAPSHOT_POOL=32
+export VICTORY_SNAPSHOT_POOL_MB=128
+export VICTORY_STAGING_BLOCKS=2
+export VICTORY_RIPE_BLOCKS=2
+export VICTORY_BURY_LAG=8
+export VICTORY_IDLE_FRAMES=4
+
+# 16 GB VRAM (ReBAR) caps — keep BAR below texture room so world textures never starve
+export VICTORY_WINDOW_KB=256
+export VICTORY_WINDOW_TAILS=1
+export VICTORY_WINDOWS_BAR_MB="${VICTORY_WINDOWS_BAR_MB:-1536}"
+export VICTORY_BUFFERS_BAR_MB="${VICTORY_BUFFERS_BAR_MB:-1024}"
+export VICTORY_UPLOAD_BAR=1
+export VICTORY_BAR_ROOM_PERCENT="${VICTORY_BAR_ROOM_PERCENT:-82}"
+export VICTORY_CARD_BUFFERS_MIN_KB=64
+export VICTORY_CARD_BUFFERS_MB="${VICTORY_CARD_BUFFERS_MB:-2048}"
+export VICTORY_CARD_ROOM_FOR_BUFFERS=1
+export VICTORY_CARD_ROOM_FOR_TARGETS_MB="${VICTORY_CARD_ROOM_FOR_TARGETS_MB:-1800}"
+export VICTORY_TEXTURE_ROOM_PERCENT="${VICTORY_TEXTURE_ROOM_PERCENT:-92}"
+export VICTORY_PIPELINE_WAIT_MS="${VICTORY_PIPELINE_WAIT_MS:-500}"
+
+exec "$WINE" "$VICTORY" run --console series-s "$@" "$(to_wine_path "$GAME_LINUX_DIR/game.exe")" --execute
