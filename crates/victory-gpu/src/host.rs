@@ -433,6 +433,9 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::trim();
+    crate::list::trim_idle();
+    trim_spare();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1913,10 +1916,43 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 /// lists put a few constants or a rectangle's corners there, and every
 /// list that did took 4 MiB of the PC's memory for it.
 const SCRATCH_FIRST: u64 = 256 << 10;
-/// The most bytes of chunks kept while no list holds them.
-const SPARE_MOST: u64 = 128 << 20;
+/// The most bytes of chunks kept while no list holds them (`VICTORY_SPARE_MB`, 128).
+fn spare_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(128)
+            << 20
+    })
+}
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
+
+fn trim_spare() {
+    const LOW_RAM: u64 = 4 << 30;
+    if !available_physical_ram().is_some_and(|avail| avail < LOW_RAM) {
+        return;
+    }
+    let keep = (spare_most() / 2).min(16 << 20);
+    let mut freed = Vec::new();
+    {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > keep {
+            let Some((chunk, size)) = spare.kept.pop() else {
+                break;
+            };
+            spare.bytes = spare.bytes.saturating_sub(size);
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+            freed.push(chunk);
+        }
+    }
+    drop(freed);
+}
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1997,7 +2033,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { spare_most() })
             } else {
                 Some(chunk)
             };
@@ -8482,6 +8518,14 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static BAR: OnceLock<bool> = OnceLock::new();
+        if *BAR.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_BAR").is_some_and(|v| v == "1"))
+            && self.mapped_card_memory()
+            && self.video_memory().is_none_or(|[budget, used, ..]| used + size < budget / 4 * 3)
+            && let Some(buf) = self.mapped_card_buffer(size, false)
+        {
+            return Some(buf);
+        }
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {

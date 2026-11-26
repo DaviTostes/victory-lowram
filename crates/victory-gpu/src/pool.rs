@@ -33,8 +33,29 @@ const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
-/// crash-1 held 5.2 GB of them.
+/// crash-1 held 5.2 GB of them (`VICTORY_STAGING_BLOCKS`, 8).
 const STAGING_KEPT: usize = 8;
+
+fn staging_kept() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_BLOCKS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(STAGING_KEPT)
+    })
+}
+
+/// Drops rested empty blocks from both pools (called from host::sweep).
+pub(crate) fn trim() {
+    let t = now();
+    {
+        let mut st = lock(&STAGING);
+        st.most = staging_kept();
+        st.rested(t);
+    }
+    lock(&TEXTURES).rested(t);
+}
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 

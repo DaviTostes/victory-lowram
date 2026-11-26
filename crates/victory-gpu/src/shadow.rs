@@ -1288,18 +1288,30 @@ fn snapshots_kept() -> usize {
     *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
 }
 
+/// Max total bytes of pooled snapshot buffers (`VICTORY_SNAPSHOT_POOL_MB`, 512).
+fn snapshot_pool_bytes() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(512)
+            << 20
+    })
+}
+
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// the largest, and of those the largest one and the next ones up to
+/// [`snapshot_pool_bytes`] bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let cap_bytes = snapshot_pool_bytes();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > cap_bytes {
             break;
         }
         kept += 1;
@@ -2803,7 +2815,30 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
+    static IDLE_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let idle_frames = *IDLE_FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_IDLE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+    });
+    // Also trim pooled snapshot buffers when physical RAM is tight.
+    if crate::host::available_physical_ram().is_some_and(|avail| avail < (4 << 30)) {
+        let cap_bytes = (snapshot_pool_bytes() / 2).min(32 << 20);
+        let gone: Vec<Vec<u8>> = {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut kept, mut total) = (0, 0usize);
+            for v in pool.iter() {
+                total = total.saturating_add(v.capacity());
+                if total > cap_bytes {
+                    break;
+                }
+                kept += 1;
+            }
+            pool.split_off(kept)
+        };
+        drop(gone);
+    }
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2816,7 +2851,7 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
