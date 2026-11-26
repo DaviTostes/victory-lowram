@@ -136,7 +136,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; uint slices;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -158,8 +158,7 @@ float3 seen(int2 p, float2 size) {
 RWTexture2D<float3> radiance : register(u0);
 [numthreads(8, 4, 1)]
 void keep(uint3 at : SV_DispatchThreadID) {
-    uint w, h;
-    radiance.GetDimensions(w, h);
+    uint w = width, h = height;
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
@@ -228,8 +227,7 @@ RWTexture3D<float3> scattered : register(u0);
 // window the air outside may be as bright as the sky is).
 [numthreads(8, 8, 2)]
 void clear_air(uint3 at : SV_DispatchThreadID) {
-    uint w, h, d;
-    scattered.GetDimensions(w, h, d);
+    uint w = width, h = height, d = slices;
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
@@ -484,6 +482,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = views.slices;
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
