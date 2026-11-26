@@ -168,9 +168,24 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
 }
 
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
-/// a view of ours of the same pages.
+/// a view of ours of the same pages, or directly when `[at, end)` is
+/// committed `MEM_PRIVATE` memory (Wine path for `VICTORY_PORT_CONSTANTS=1`).
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
+        let len = end - at;
+        if len <= MOST && committed_private(at as usize, len as usize) {
+            return match crate::inplace::open(device, crate::inplace::From::Part(at as usize, len as usize)) {
+                Ok(heap) => {
+                    tracing::info!(
+                        start = format_args!("{at:#x}"),
+                        bytes = len,
+                        "renderer port 1: a private stretch of the title's 32-bit graphics memory opened directly as a host heap (Wine MEM_PRIVATE)"
+                    );
+                    Ok(Region { start: at, end, heap })
+                }
+                Err(e) => Err((5, format!("refused by the host (MEM_PRIVATE): {e}"))),
+            };
+        }
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
     // The whole stretch, kept to what may be ported: the next buffer in it
@@ -223,6 +238,28 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             Err((5, format!("refused by the host: {e}")))
         }
     }
+}
+
+/// Whether every page of `[at, at + len)` is committed `MEM_PRIVATE` memory.
+fn committed_private(at: usize, len: usize) -> bool {
+    let mut here = at;
+    while here < at + len {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { mem::VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != mem::MEM_COMMIT
+            || info.Type != mem::MEM_PRIVATE
+        {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= here {
+            return false;
+        }
+        here = next;
+    }
+    true
 }
 
 /// Whether every page of `[at, at + len)` is committed.

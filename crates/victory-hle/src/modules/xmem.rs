@@ -1191,6 +1191,94 @@ fn arrange(base: usize, pages: &[usize]) {
     }
 }
 
+/// On Wine with `VICTORY_PORT_CONSTANTS=1`, replaces a placeholder inside
+/// `LOW_RESERVATIONS` with `MEM_PRIVATE` committed RAM instead of a
+/// file-mapping section view: `vkd3d-proton`'s `OpenExistingHeapFromAddress1`
+/// (`VK_EXT_external_memory_host` on RADV) is fully coherent (CPU+GPU reads,
+/// copies, and shader UAV writes) on `MEM_PRIVATE` memory, whereas Wine's
+/// `MapViewOfFile` section views are not.
+fn map_private_low(base: usize, len: usize) -> bool {
+    if !on_wine() || !port_on() {
+        return false;
+    }
+    let in_low = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(at, size)| at <= base && base.saturating_add(len) <= at.saturating_add(size));
+    if !in_low {
+        return false;
+    }
+    split(base, len);
+    // SAFETY: `[base, base + len)` is a placeholder in the title's 32-bit
+    // graphics reservation. Try `MEM_WRITE_WATCH` first so the descriptor
+    // heap inside this range gets kernel userfaultfd write-watching too.
+    let mut watched = false;
+    let mut at = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            base as *const c_void,
+            len,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if at as usize == base {
+        watched = true;
+    } else {
+        at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base as *const c_void,
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+    }
+    if at as usize != base {
+        let reserved = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base as *const c_void,
+                len,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if reserved as usize == base {
+            at = unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) };
+        }
+    }
+    if at as usize != base {
+        tracing::warn!(
+            at = format_args!("{base:#x}"),
+            len,
+            error = %std::io::Error::last_os_error(),
+            "renderer port 1 (Wine): MEM_PRIVATE placeholder replacement failed, falling back to section view"
+        );
+        return false;
+    }
+    victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::title_memory_allocated(base, len);
+    if watched {
+        victory_gpu::title_memory_watched(base, len);
+    }
+    tracing::info!(
+        at = format_args!("{base:#x}"),
+        len,
+        watched,
+        "renderer port 1 (Wine): mapped 32-bit graphics range as MEM_PRIVATE for zero-copy host heap"
+    );
+    true
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1203,6 +1291,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
+    if let Some(pages) = &pages
+        && !pages.is_empty()
+        && map_private_low(base, pages.len() * PAGE)
+    {
+        return address;
+    }
     if port_on()
         && let Some(pages) = &pages
     {

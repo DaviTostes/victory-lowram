@@ -388,11 +388,13 @@ pub(crate) fn sync_heaps() {
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
+        let port = crate::port_descriptors::adopted(start);
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
             continue;
         };
+        if heap.written.is_none() && !port {
+            continue;
+        }
         let step = u64::from(step);
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
@@ -422,7 +424,6 @@ pub(crate) fn sync_heaps() {
         // Ranges of the heap to look at, and whether a range is one the
         // fallback of renderer port #2 looks at whole.
         let mut parts: Vec<(usize, usize, bool)> = Vec::new();
-        let port = crate::port_descriptors::adopted(start);
         if port {
             // Renderer port #2: the slots the title's patched stores and our
             // calls marked, in place of the changed pages; and a few of the
@@ -433,7 +434,9 @@ pub(crate) fn sync_heaps() {
                 parts.push((from, from + n as usize * step as usize, false));
             }
             phase.end();
-            if crate::port_descriptors::ask_due(frame) {
+            if let Some(written) = &heap.written
+                && crate::port_descriptors::ask_due(frame)
+            {
                 let began = std::time::Instant::now();
                 let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
                 let taken = written.take(start as usize, end as usize);
@@ -444,7 +447,7 @@ pub(crate) fn sync_heaps() {
             for page in crate::port_descriptors::to_check(frame) {
                 parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
             }
-        } else {
+        } else if let Some(written) = &heap.written {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
             let taken = written.take(start as usize, end as usize);

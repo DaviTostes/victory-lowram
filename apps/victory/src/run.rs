@@ -163,13 +163,10 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
-    if execute {
-        let size = image.info().size_of_image as usize;
-        // SAFETY: the image stays mapped, and nothing of it has run yet.
-        unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
-    }
     // Renderer port #2 (VICTORY_PORT_DESCRIPTORS=1): the title's stores of
-    // descriptor records tell the layer their slots.
+    // descriptor records tell the layer their slots. Applied before
+    // `write_sites` so a write-sites list containing one of these offsets
+    // cannot overwrite the store first and disable port #2.
     #[cfg(windows)]
     if execute && victory_hle::port_descriptors::on() {
         use victory_loader::descriptor_sites::{Hooked, SITES, apply};
@@ -180,6 +177,11 @@ pub fn run(
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
         println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
+    }
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, and nothing of it has run yet.
+        unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
     // clock ticks at that interval (victory-gpu), and the title is given
