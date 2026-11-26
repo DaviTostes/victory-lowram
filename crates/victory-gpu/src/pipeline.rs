@@ -429,6 +429,23 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// Extracts an embedded shader entry-point name (e.g. `CS_...`) from a console
+/// shader container for diagnostics.
+fn container_name(container: &[u8]) -> Option<&str> {
+    for prefix in [b"CS_".as_slice(), b"PS_", b"VS_", b"MS_", b"AS_"] {
+        if let Some(pos) = container.windows(prefix.len()).position(|w| w == prefix) {
+            let end = container[pos..]
+                .iter()
+                .position(|&b| !(b.is_ascii_alphanumeric() || b == b'_'))
+                .map_or(container.len(), |n| pos + n);
+            if end - pos >= 6 && let Ok(s) = std::str::from_utf8(&container[pos..end]) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -441,7 +458,16 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        #[cfg(windows)]
+        let skipped = skipped_shaders(std::slice::from_ref(shader)).is_some();
+        #[cfg(not(windows))]
+        let skipped = false;
+        if skipped {
+            let name = container_name(&shader.container).unwrap_or("unknown");
+            tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, name, "first bind (skipped)");
+        } else {
+            tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        }
     }
 }
 

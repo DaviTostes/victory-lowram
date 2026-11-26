@@ -324,7 +324,8 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
-        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+        + BUFFER_MAPPED_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
 }
@@ -502,7 +503,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * crate::host::bar_room_percent()
     {
         return None;
     }
@@ -513,6 +514,44 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+    }
+    made
+}
+
+/// The most bytes of non-UAV title buffers that lie directly in card memory
+/// mapped by the CPU (`VICTORY_BUFFERS_BAR_MB`; 0, the default, none): one
+/// `D3D12_HEAP_TYPE_GPU_UPLOAD` buffer in ReBAR VRAM with no PC-RAM staging
+/// twin and no GPU copy/hash passes.
+fn buffer_mapped_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_BUFFERS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// Bytes alive of non-UAV title buffers in card memory the CPU maps.
+static BUFFER_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// A single-sided BAR-mapped buffer in card memory for a read-only (non-UAV)
+/// title buffer of `size` bytes, if `VICTORY_BUFFERS_BAR_MB` allows it.
+fn buffer_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let most = buffer_mapped_most();
+    if most == 0 {
+        return None;
+    }
+    let host = host()?;
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 100 * crate::host::bar_room_percent()
+    {
+        return None;
+    }
+    if BUFFER_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+        BUFFER_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let made = host.mapped_card_buffer(size, true);
+    if made.is_none() {
+        BUFFER_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
     made
 }
@@ -2499,7 +2538,11 @@ impl Drop for Shadow {
         }
         let window = self.window;
         if self.mapped {
-            WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+            if window {
+                WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+            } else {
+                BUFFER_MAPPED_BYTES.fetch_sub(self.len.next_multiple_of(1 << 16), Ordering::Relaxed);
+            }
         }
         if let Some(card) = &mut self.card {
             if window {
@@ -4779,6 +4822,7 @@ mod land_tests {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    uav: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -4853,11 +4897,18 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    register_flags(resource, start, len, true);
+}
+
+/// A title buffer exists at `start` (`len` bytes), with whether its console
+/// description allows unordered access (`uav`).
+pub(crate) fn register_flags(resource: usize, start: u64, len: u64, uav: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
+            uav,
         },
     );
 }
@@ -5007,6 +5058,19 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
+        // Non-UAV title buffers under 16 MiB can live directly in ReBAR VRAM
+        // (`D3D12_HEAP_TYPE_GPU_UPLOAD`) with no PC-RAM staging twin and no
+        // GPU copy/hash passes. Larger shared heaps (>= 16 MiB) stay on the
+        // two-sided card path in case placed UAV views alias them.
+        if !entry.uav && size < (16 << 20) && let Some((buffer, data)) = buffer_mapped_for(size) {
+            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} mapped on the card", key.0));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.mapped = true;
+            entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;

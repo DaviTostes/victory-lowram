@@ -145,6 +145,16 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
+pub(crate) fn bar_room_percent() -> u64 {
+    static PERCENT: OnceLock<u64> = OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_BAR_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or_else(|| (crate::resource::room_percent() + 6).min(93), |p| p.clamp(50, 96))
+    })
+}
+
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
@@ -154,8 +164,8 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
     let room = crate::resource::room_percent();
     let hi = room.saturating_sub(2).max(50);
-    let lo = room.saturating_sub(5).max(45);
-    let urgent = (room + 5).min(97);
+    let lo = room.saturating_sub(6).max(45);
+    let urgent = room.min(97);
     let share = |percent: u64| budget / 100 * percent;
     if used < share(hi) {
         (KEPT_MS, u64::MAX)
@@ -5647,19 +5657,28 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            let mut texture_ranges: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    match step {
+                        Step::Refresh(shadow, address, len) if shadow.asked_ahead() => {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        Step::Texture(staging) if !staging.is_once() => {
+                            let (at, len) = staging.memory();
+                            if len > 0 {
+                                texture_ranges.push((at, at + len));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let mut ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            ranges.extend(texture_ranges);
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -8117,7 +8136,22 @@ impl Batch {
         let started = std::time::Instant::now();
         let before = PREPARING[2].load(Ordering::Relaxed);
         let due = std::mem::take(&mut self.due);
+        let ranges: Vec<(usize, usize)> = due
+            .iter()
+            .filter(|s| !s.is_once())
+            .filter_map(|s| {
+                let (at, len) = s.memory();
+                (len > 0).then_some((at, at + len))
+            })
+            .collect();
+        let ahead = ranges.len() > 1;
+        if ahead {
+            crate::watch::ask_ahead(&ranges);
+        }
         crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
+        if ahead {
+            crate::watch::ask_ahead_done();
+        }
         let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
         PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
@@ -8551,7 +8585,7 @@ impl Host {
         static BAR: OnceLock<bool> = OnceLock::new();
         if *BAR.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_BAR").is_some_and(|v| v == "1"))
             && self.mapped_card_memory()
-            && self.video_memory().is_none_or(|[budget, used, ..]| used + size < budget / 4 * 3)
+            && self.video_memory().is_none_or(|[budget, used, ..]| used + size < budget / 100 * bar_room_percent())
             && let Some(buf) = self.mapped_card_buffer(size, false)
         {
             return Some(buf);

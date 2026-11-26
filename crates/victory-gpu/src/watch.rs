@@ -1571,12 +1571,16 @@ impl Guards {
 
     /// A write fault opened `block`.
     fn opened(&mut self, block: usize) {
-        const MANY: usize = 1 << 13;
+        const MANY: usize = 1 << 16;
         if self.opened.len() >= MANY {
             let keep_ms = rest().as_millis().max(50);
             self.opened.retain(|_, at| at.elapsed().as_millis() < keep_ms);
             if self.opened.len() >= MANY {
-                self.opened.clear();
+                let half_ms = (keep_ms / 2).max(25);
+                self.opened.retain(|_, at| at.elapsed().as_millis() < half_ms);
+                if self.opened.len() >= MANY {
+                    self.opened.clear();
+                }
             }
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);

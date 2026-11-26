@@ -1139,6 +1139,11 @@ impl Staging {
         (self.memory as usize, self.read)
     }
 
+    /// Whether this staging buffer is uploaded once and never refreshed again.
+    pub(crate) fn is_once(&self) -> bool {
+        self.once.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The title's level and the array slice of the staging buffer's part
     /// `i`.
     fn part(&self, i: usize) -> (u32, u32) {
