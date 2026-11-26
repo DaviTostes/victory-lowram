@@ -151,7 +151,7 @@ pub(crate) fn bar_room_percent() -> u64 {
         std::env::var("VICTORY_BAR_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or_else(|| (crate::resource::room_percent() + 6).min(93), |p| p.clamp(50, 96))
+            .map_or_else(|| crate::resource::room_percent().saturating_sub(4).max(50), |p| p.clamp(50, 96))
     })
 }
 

@@ -1307,6 +1307,10 @@ pub(crate) fn look_at_holes() {
     if !known_holes() {
         return;
     }
+    // Never race with `xmem::map()` between `MapViewOfFile3` and `title_memory_remapped`.
+    let Some(_reading) = title_memory_reading_now() else {
+        return;
+    };
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
         let g = guards();
@@ -1996,25 +2000,94 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// it), a write through it would not be seen: that block is not clean, and
 /// told as written at every asking, until it can. Whether all are covered.
 fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
-    let mut all = true;
-    for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
-        let block = page / BLOCK;
-        if !g.protected.contains(block) {
-            continue; // not there, or not ours to guard
-        }
+    let entries: Vec<(usize, Vec<usize>)> = elsewhere(from * BLOCK, (to - from) * BLOCK)
+        .into_iter()
+        .filter_map(|(page, others)| {
+            let block = page / BLOCK;
+            g.protected.contains(block).then_some((block, others))
+        })
+        .collect();
+    if entries.is_empty() {
+        return true;
+    }
+    let r = rest();
+    let mut todo: Vec<usize> = Vec::new();
+    for (block, others) in &entries {
         #[cfg(feature = "diagnostics")]
         ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        g.aliased.insert(block);
-        let mut covered = true;
-        for other in others {
-            covered &= protect_alias(g, other / BLOCK);
+        g.aliased.insert(*block);
+        for &other in others {
+            let ob = other / BLOCK;
+            g.aliased.insert(ob);
+            if !g.protected.contains(ob) && !g.left_alone(ob) && !g.rests(ob, r) {
+                todo.push(ob);
+            }
         }
-        if !covered {
+    }
+    if !todo.is_empty() {
+        todo.sort_unstable();
+        todo.dedup();
+        protect_aliases(g, &todo);
+    }
+    let mut all = true;
+    for (block, others) in entries {
+        if !others.iter().all(|&other| g.protected.contains(other / BLOCK)) {
             all = false;
             g.clean.remove(block);
         }
     }
     all
+}
+
+/// Makes sorted, deduplicated alias blocks read-only, coalescing contiguous
+/// runs into one `VirtualProtect` call each (falling back per-block on failure).
+fn protect_aliases(g: &mut Guards, blocks: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut i = 0;
+    while i < blocks.len() {
+        let from = blocks[i];
+        let mut to = from + 1;
+        i += 1;
+        while i < blocks.len() && blocks[i] == to {
+            to += 1;
+            i += 1;
+        }
+        if to - from == 1 {
+            protect_alias(g, from);
+            continue;
+        }
+        for b in from..to {
+            PROTECTED.set(b);
+        }
+        let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: title view memory; only its protection changes.
+        let done = unsafe {
+            VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(5, (to - from) as u64);
+            tally(8, started.elapsed().as_nanos() as u64);
+        }
+        if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+            g.protected.insert_all(from..to);
+            #[cfg(feature = "diagnostics")]
+            for b in from..to {
+                crate::faultbook::note(crate::faultbook::What::Alias, b, 0, 0);
+            }
+            continue;
+        }
+        if done {
+            // SAFETY: restore unexpected protection before per-block fallback.
+            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+        }
+        for b in from..to {
+            PROTECTED.clear(b);
+            protect_alias(g, b);
+        }
+    }
 }
 
 /// Makes `block` read-only: another view of a page a copy is about to take
