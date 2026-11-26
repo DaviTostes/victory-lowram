@@ -3061,8 +3061,8 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 
 /// The resource [`texture_at`] made for a texture placed at `address` with
 /// the description `desc`, if it has made one: never made here (for the
-/// frame listing, which must not count as a use).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// frame listing and `VICTORY_REASK_BLANK`, which must not count as a use).
+#[cfg(windows)]
 pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
@@ -4633,4 +4633,16 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
     }
+}
+
+/// The formats a host texture of `format` is made castable to (upstream #2462).
+pub(crate) fn castable(format: u32) -> Vec<u32> {
+    const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    let Some(e) = element(format) else {
+        return Vec::new();
+    };
+    (1..=115)
+        .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
+        .filter(|&f| !(family(f) == f && family(f + 1) == f))
+        .collect()
 }

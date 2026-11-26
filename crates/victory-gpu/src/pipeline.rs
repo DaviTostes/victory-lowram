@@ -535,13 +535,23 @@ pub(super) fn skipped_shaders(shaders: &[Arc<Shader>]) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
-        return None;
+    if let Some(shader) = shaders.iter().find(|shader| hashes.contains(&shader.hash)) {
+        return Some(shader.hash.as_str());
     }
-    shaders
-        .iter()
-        .find(|shader| hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
+    // Without the BVH builder (`VICTORY_BVH_BUILDER=1`), running
+    // `CS_ScreenProbes_ActivateRays` with no rays behind it destroys light,
+    // shadows and reflections (ported from Belobug/VIctory-Belobug-AMD 6986a57).
+    static BVH_ALLOWED: OnceLock<bool> = OnceLock::new();
+    let bvh = *BVH_ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"));
+    if !bvh {
+        const ACTIVATE_RAYS: &[u8] = b"CS_ScreenProbes_ActivateRays";
+        if let Some(shader) = shaders.iter().find(|s| {
+            s.stage == "compute" && s.container.windows(ACTIVATE_RAYS.len()).any(|w| w == ACTIVATE_RAYS)
+        }) {
+            return Some(shader.hash.as_str());
+        }
+    }
+    None
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]

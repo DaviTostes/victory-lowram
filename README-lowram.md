@@ -18,15 +18,20 @@ Targeted and tested on:
    - `compose.rs`: code-built D3D12 root signature (no `[RootSignature(RS)]` HLSL attribute) so Xbox Series S two-plane compose works cleanly under Wine.
    - Coalesced alias `VirtualProtect` calls and fixed `look_at_holes()` vs `xmem::map()` race (`title_memory_reading_now()`).
    - Pipeline compile timeout & known-deadlock skip list (`VICTORY_SKIP_PIPELINES`) for `vkd3d-proton`.
-2. **16 GB VRAM / Low-RAM stability**
+2. **16 GB VRAM / Low-RAM stability & visual fidelity**
+   - **`VICTORY_DSTORAGE_IO=direct`:** streams `.rpf` assets via `FILE_FLAG_NO_BUFFERING` (`O_DIRECT` under Wine), preventing Linux page-cache bloat from evicting the game's working set on 16 GB RAM hosts.
+   - **Idle VRAM offload:** shifts more window/buffer/BVH arenas (`VICTORY_WINDOWS_BAR_MB=2560`, `VICTORY_BUFFERS_BAR_MB=2048`, `VICTORY_CARD_BUFFERS_MB=3072`, `VICTORY_MEMORY_CARD_MB=2560`, `VICTORY_BAR_ROOM_PERCENT=88`) out of tight 16 GB system RAM into free 16 GB VRAM (cutting swap usage by ~1.7 GB and reaching **5.0–8.6 FPS** even in `diag` builds with full RT).
    - `bar_room_percent()` defaults to `room_percent() - 4` (`VICTORY_BAR_ROOM_PERCENT`), keeping ReBAR buffer/window pools strictly below the texture VRAM budget so world textures never starve (`the card has no room`).
-   - `descriptor/host.rs`: `keep_shown` is gated by `crate::resource::room_lately()`, releasing old replaced textures immediately when VRAM is tight (ported from `Belobug/VIctory-Belobug-AMD`).
+   - `descriptor/host.rs`: `keep_shown` is gated by `crate::resource::room_lately()` (ported from `Belobug/VIctory-Belobug-AMD`).
    - Portable Low-RAM launchers clamping retained host pools (`VICTORY_KEEP_FREED=0`, `VICTORY_LIST_POOL_MB=32`, `VICTORY_SNAPSHOT_POOL_MB=128`, `VICTORY_STAGING_BLOCKS=2`, `VICTORY_RIPE_BLOCKS=2`).
-3. **Correctness & throughput ports**
-   - **Renderer Port 6 & 7** (`VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`): 10–20× reduction in `GUARDS` lock waits and 64-way sharded `JOURNAL` lock.
-   - **RDNA4 magenta screen-probe filter** in `ambient.rs` (ported from `Belobug/VIctory-Belobug-AMD`).
-   - **BC7 mode 4/5 rotation fix** in `crates/victory-formats/src/bcpack.rs` (upstream PR `#3111`).
-   - **`VICTORY_SETTLE_ROOM=1` / `VICTORY_MERGE_RUNS`**: doubles `late_most` (256 → 512 in-flight lists) and raises shader-write merge run budget (512 → 4096).
+3. **Correctness, lighting, mesh/LOD, & texture ports**
+   - **Real Ray Tracing (`VICTORY_BVH_BUILDER=1`)** enabled by default (all 53 BVH builder pipelines compile and run on RADV; ~25 ms GPU frame time on RX 9060 XT when VRAM-backed buffers are used).
+   - **Typed 32-bit integer buffer views (`bit_exact_format`, PR `#684`):** maps `R32*_{UINT,SINT}` typed buffer views to matching `FLOAT` formats so `bufferStore.f32` preserves packed meshlet culling indices bit-for-bit on RADV/D3D12.
+   - **RDNA2 `v_mad_legacy_f32` / `v_mac_legacy_f32` semantics (PR `#1026`):** fused FMA + subnormal flush (`ftz`) + zero-factor rule (`0 * inf = 0`).
+   - **Skin/decoration bake source uploads (`VICTORY_BAKE_SOURCES=1`, PR `#1264`):** uploads each skin-bake draw's own sampled source textures ahead of the draw (`0` missing skin-bake sources; restores character facial/skin/bruise details).
+   - **Blank/stale placed texture recovery (`VICTORY_REASK_BLANK=1`, `fxceless 06702fe`):** re-queues placed texture slots left stuck NULL/zero after aliasing invalidation once their memory is committed, plus `VICTORY_TEXTURE_LOOK_MS=500` so waiting textures don't back off for 30+ seconds.
+   - **Lighting fallbacks (`VICTORY_BVH_BUILDER=0`):** skips `CS_ScreenProbes_ActivateRays` without rays (`belobug 6986a57`), adds `VICTORY_AMBIENT_REFLECT=0.5` reflection clamping on `CS_UpdateHistory`, `VICTORY_AMBIENT_AIR=1.5`, `VICTORY_AMBIENT_SETTLE=250,3,1.5`, and RDNA4 magenta screen-probe filter.
+   - **Renderer Port 6 & 7** (`VICTORY_PORT_GUARD=1`, `VICTORY_PORT_JOURNAL=1`), null CBV clear (`#2449`), typed UAV store format check (`#2462`), BC7 mode 4/5 rotation fix (`#3111`), and `VICTORY_SETTLE_ROOM=1`.
 
 ## Linux Host Prerequisites (Critical — 3×+ speedup!)
 
@@ -55,8 +60,8 @@ cargo xwin build --profile diag --features diagnostics --target x86_64-pc-window
 
 Three portable launchers are included in [`scripts/`](scripts/):
 
-- **`scripts/play-linux-lowram.sh`** *(Recommended for 16 GB RAM + 16 GB VRAM)* — Xbox Series X Low-RAM 1080p mode with ambient stand-in. Measured **5.3–6.7 FPS (148.9 ms/frame, 84% GPU busy, 13.6 GB VRAM, 0 settles/frame)** on RX 9060 XT 16 GB + Arch Linux / Wine 11.22.
-- **`scripts/play-linux-quality.sh`** — Xbox Series X Low-RAM 1080p mode with BVH/Ray Tracing enabled.
+- **`scripts/play-linux-lowram.sh`** *(Recommended for 16 GB RAM + 16 GB VRAM)* — Xbox Series X Low-RAM 1080p mode with **Real Ray Tracing (`VICTORY_BVH_BUILDER=1`)**, `VICTORY_DSTORAGE_IO=direct`, `VICTORY_BAKE_SOURCES=1`, `VICTORY_REASK_BLANK=1`, `VICTORY_TEXTURE_LOOK_MS=500`, and VRAM-backed buffers (`PORT_CONSTANTS=0`, `PORT_CBV=0`, `INPLACE=0`). Measured **5.0–8.6 FPS (116.8 ms/frame, 6–12% GPU busy, ~7.4–9.3 GB VRAM)** with crisp character faces, expressions, skin details, and RT lighting on RX 9060 XT 16 GB + Arch Linux / Wine 11.22.
+- **`scripts/play-linux-quality.sh`** — Same Real Ray Tracing profile with higher pipeline wait budget (`300 ms`).
 - **`scripts/play-linux-series-s.sh`** — Xbox Series S mode (`--console series-s`, 7.6 GiB console RAM). Note: because the 7.6 GiB console budget causes heavier in-game texture streaming churn on GTA VI, `play-linux-lowram.sh` (Series X) is significantly faster on 16 GB RAM + zram hosts.
 
 Example:
@@ -72,13 +77,12 @@ WINEPREFIX="$HOME/.wine-gta" \
 
 | Flag | Value | Measured Impact |
 | --- | --- | --- |
-| `VICTORY_PORT_CONSTANTS=1` | `1` *(Wine `MEM_PRIVATE`)* | Zero-copy 174 MB 32-bit heap via `VK_EXT_external_memory_host` (`5,464 fills/frame`, `10.6 ms` copies, `96–99%` GPU busy, `13.28 GB` VRAM) |
+| `VICTORY_BVH_BUILDER=1` | `1` *(default)* | All 53 BVH builder pipelines run on RADV (~25 ms GPU time); restores real RT GI, reflections, and nighttime/interior lighting |
+| `VICTORY_PORT_CONSTANTS=0` + `VICTORY_INPLACE=0` | `0` *(Wine/RADV)* | Keeps GPU buffers in fast VRAM instead of PCIe host RAM (`VK_EXT_external_memory_host`), cutting GPU time **15×** (380 ms → 25 ms) and fixing missing roads/vehicles in the opening cutscene |
 | `VICTORY_PORT_DESCRIPTORS=1` | `1` + `CHECK=4` | `6/6` stores patched (99.93% captured); `327 → 4` heap pages, `32.15 → 0.00–1.80 ms` asking |
-| `VICTORY_PORT_GUARD=1` | `1` | Cuts `GUARDS` lock waits 10–100× (`0.25–1.02 ms`, `17–32 faults/frame` with Port 1) |
-| `VICTORY_GUARD_HOT=150` | `150` ms | Cuts hot-block fault storms and claim spins (`92k → 21–228`) |
-| `VICTORY_PORT_JOURNAL=1` | `1` | 64-way sharded `JOURNAL` lock (`0.00 ms` lock wait, `0.01 ms` heap-record wait) |
-| `VICTORY_SETTLE_ROOM=1` | `1` | Fewer mid-frame settles (`512` lists, `4096` merged runs) |
-| `VICTORY_RESIDENCY=1` + `VICTORY_RESIDENCY_LIMITED=1` | `1` | Caps `UPLOAD_AHEAD` to 32 MiB and drops idle staging/scratch when free RAM < 3 GiB |
-| `VICTORY_TEXTURE_STAGE_MS=35` + `VICTORY_TEXTURE_CATCHUP=0` | `35` ms / `64` MB | Cuts `heap buffers` recording-thread stalls **15×** (`471–592 ms → 10–40 ms`) |
-| `VICTORY_PIPELINE_WAIT_MS=50` | `50` ms | Prevents background shader compiles from locking cutscenes to 2 FPS |
-| `VICTORY_PORT_CBV=1` | **OFF by default** | Changes shader cache key; only enable if pre-warming shaders |
+| `VICTORY_PORT_GUARD=1` + `VICTORY_PORT_JOURNAL=1` | `1` | Cuts `GUARDS` lock waits 10–100× and 64-way shards `JOURNAL` lock (`0.00 ms` lock wait) |
+| `VICTORY_DSTORAGE_IO=direct` | `direct` | Bypasses Linux page cache (`O_DIRECT`) when streaming `.rpf` files so 16 GB RAM isn't flooded by file cache |
+| `VICTORY_BAKE_SOURCES=1` + `VICTORY_REASK_BLANK=1` | `1` | `0` missing skin-bake sources (restores face/skin/bruise detail) and re-queues stuck blank placed texture slots |
+| `VICTORY_TEXTURE_LOOK_MS=500` | `500` ms | Cuts texture upload latency in half (`1100 ms → 574 ms`, `90% < 1 s`) instead of 30+ s backoff |
+| `VICTORY_WINDOWS_BAR_MB=2560` + `VICTORY_BUFFERS_BAR_MB=2048` + `VICTORY_CARD_BUFFERS_MB=3072` | VRAM offload | Moves buffers out of tight 16 GB system RAM into idle 16 GB VRAM (~1.7 GB less swap, up to 8.6 FPS in diag) |
+| `VICTORY_RESIDENCY=1` + `VICTORY_RESIDENCY_LIMITED=1` | `1` | Protects 16 GB host against OOM during heavy world streaming |
