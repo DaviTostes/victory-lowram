@@ -225,7 +225,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         dst_args[dst_at + 1] = groups.y;
         dst_args[dst_at + 2] = groups.z;
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + off / 4] = src_args.Load(src_at + off);
         }
     }
 }
