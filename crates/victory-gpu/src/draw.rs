@@ -4929,7 +4929,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => self.bind(list, p, true) && (!self.planes_due(list) || self.bind(list, p, true)),
             _ => false,
         };
         if !ran {

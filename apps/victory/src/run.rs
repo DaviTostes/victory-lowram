@@ -177,6 +177,14 @@ pub fn run(
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
         println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
+        if std::env::var("VICTORY_PORT_COPIES").is_ok_and(|v| v.trim() == "1") {
+            use victory_loader::descriptor_sites::{TITLE_MEMCPY, apply_copies};
+            let hook = victory_hle::port_descriptors::title_copy_hook(image.base() + TITLE_MEMCPY);
+            // SAFETY: as above; the hook is a function of ours.
+            let done = unsafe { apply_copies(image.base(), size, victory_hle::port_descriptors::marks_address(), hook) };
+            let copies = done.iter().filter(|d| **d == Hooked::Done).count();
+            println!("renderer port 2: {copies} of {} table copies of the title patched", done.len());
+        }
     }
     if execute {
         let size = image.info().size_of_image as usize;

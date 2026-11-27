@@ -3726,7 +3726,9 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // (fxceless #1407, PiloteCode) Saturate at the copy's start so a
+            // copy beginning mid-piece never wraps and skips its first slice.
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {

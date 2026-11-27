@@ -189,7 +189,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        if !p.timed_out.load(Ordering::Relaxed) && wait(p, crate::frame::current()) {
+        if p.graphics.is_none() && compute_waits() {
+            // Made here, or waited for while a worker makes it: a dropped
+            // one-shot compute pass leaves scene state broken until the next cut.
+            p.make();
+        } else if !p.timed_out.load(Ordering::Relaxed) && wait(p, crate::frame::current()) {
             if !p.timed_out.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     key = %p.key,
@@ -203,6 +207,15 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// (PR #1312) Whether a dispatch waits for its compute pipeline until it is
+/// made, whatever the frame's budget ([`wait_budget`]); a draw still waits
+/// within the budget and is dropped while its pipeline is not there.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0` restores the old budget.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker

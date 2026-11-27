@@ -228,14 +228,26 @@ pub(crate) fn faulted(at: usize, rip: usize) {
 /// (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`, 8 if not given).
 fn check_every() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1))
+    *N.get_or_init(|| every_of(std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY").ok().as_deref()))
 }
 
 /// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`,
-/// 16 if not given; 0: none).
+/// 16 if not given; `all`: every written page at every sync; 0: none).
 fn check_budget() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16usize))
+    *N.get_or_init(|| budget_of(std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().as_deref()))
+}
+
+fn budget_of(spec: Option<&str>) -> usize {
+    match spec.map(str::trim) {
+        None => 16,
+        Some("all") => usize::MAX,
+        Some(v) => v.parse().unwrap_or(16),
+    }
+}
+
+fn every_of(spec: Option<&str>) -> u64 {
+    spec.and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1)
 }
 
 /// The fallback's pages: those the watch said were written, not looked at yet;
@@ -250,8 +262,15 @@ struct Fallback {
 
 static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback { pages: std::collections::BTreeSet::new(), asked: 0, looked: 0, next: 0 });
 
+fn whole() -> bool {
+    check_budget() == usize::MAX && check_every() == 1
+}
+
 /// Whether to ask the write watch of the marked heap this frame.
 pub(crate) fn ask_due(frame: u64) -> bool {
+    if whole() {
+        return true;
+    }
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
     if check_budget() == 0 || f.asked != 0 && frame < f.asked + check_every() {
         return false;
@@ -275,6 +294,11 @@ pub(crate) fn asked(ranges: &[(usize, usize)]) {
 /// The pages to look at whole this frame (once a frame; none after).
 pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    if whole() {
+        let out: Vec<usize> = std::mem::take(&mut f.pages).into_iter().collect();
+        CHECKED[0].fetch_add(out.len() as u64, Relaxed);
+        return out;
+    }
     if f.looked == frame {
         return Vec::new();
     }
@@ -510,6 +534,52 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     out
 }
 
+/// The title's own `memcpy`, whose calls in the frame allocator's two table
+/// copiers go to [`title_copy`] (`victory_loader::descriptor_sites::apply_copies`).
+static TITLE_MEMCPY: AtomicUsize = AtomicUsize::new(0);
+
+/// Since the last line: the title's table copies into the marked heap through
+/// its own `memcpy`, and the slots they marked.
+static TITLE_COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The function the title's patched `memcpy` calls go to, with the title's
+/// `memcpy` at `real` behind it.
+pub fn title_copy_hook(real: usize) -> usize {
+    TITLE_MEMCPY.store(real, Relaxed);
+    title_copy as *const () as usize
+}
+
+unsafe extern "system-unwind" fn title_copy(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
+    // SAFETY: the title's `memcpy`, noted before the title ran.
+    let real: Copy = unsafe { std::mem::transmute(TITLE_MEMCPY.load(Relaxed)) };
+    // SAFETY: the title's copy, by the function it asked for.
+    let out = unsafe { real(to, from, n) };
+    let marked = mark_range(to as u64, n as u64);
+    if marked > 0 {
+        TITLE_COPIES[0].fetch_add(1, Relaxed);
+        TITLE_COPIES[1].fetch_add(marked, Relaxed);
+    }
+    out
+}
+
+/// Marks every slot of the marked heap with a byte in `[to, to + n)`: how many.
+fn mark_range(to: u64, n: u64) -> u64 {
+    let len = MARKS.len.load(Acquire);
+    if len == 0 || n == 0 {
+        return 0;
+    }
+    let start = MARKS.start.load(Relaxed);
+    let (lo, hi) = (to.max(start), to.saturating_add(n).min(start + len));
+    if lo >= hi {
+        return 0;
+    }
+    let (first, last) = ((lo - start) / 32, (hi - 1 - start) / 32);
+    for slot in first..=last {
+        mark_slot(slot as usize);
+    }
+    last - first + 1
+}
+
 /// Marks slot `slot` of the marked heap (in it: checked by the caller).
 #[inline]
 fn mark_slot(slot: usize) {
@@ -545,6 +615,7 @@ pub(crate) fn line(frames: f64) {
     let ours = MARKED_BY_US.swap(0, Relaxed);
     let [pages, missed, other, pending, check_ns, tabled] = [0, 1, 2, 3, 4, 5].map(|i| CHECKED[i].swap(0, Relaxed));
     let copies = [0, 1].map(|i| COPIES[i].swap(0, Relaxed));
+    let title_copies = [0, 1].map(|i| TITLE_COPIES[i].swap(0, Relaxed));
     ALL[0].fetch_add(taken, Relaxed);
     ALL[1].fetch_add(ours, Relaxed);
     ALL[2].fetch_add(pages, Relaxed);
@@ -560,7 +631,7 @@ pub(crate) fn line(frames: f64) {
     };
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
-         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
+         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; its own memcpy's table copies {:.0}, {:.0} slots they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
          since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
@@ -569,6 +640,8 @@ pub(crate) fn line(frames: f64) {
         ns as f64 / 1e6 / frames,
         copies[0] as f64 / frames,
         copies[1] as f64 / frames,
+        title_copies[0] as f64 / frames,
+        title_copies[1] as f64 / frames,
         pages as f64 / frames,
         missed as f64 / frames,
         tabled as f64 / frames,

@@ -327,6 +327,22 @@ pub(crate) fn stands_in(this: This) -> bool {
             .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
 }
 
+/// (Op-lite/Fox T) Whether `this` is a title R9G9B9E5 texture (67) whose host
+/// copy is the 16-bit float RGBA stand-in ([`target_format`]).
+#[cfg(windows)]
+pub(crate) fn e5_stand_in(this: This) -> bool {
+    !this.is_null() && pc_format(resource(this).desc.format) == 67 && stands_in(this)
+}
+
+/// (Op-lite/Fox T, `VICTORY_E5_ALPHA_ONE=1`, default off) A shader view of an
+/// R9G9B9E5 target's stand-in reads alpha as 1, as a read of the console's
+/// format does (it has no alpha; the RGBA16F stand-in keeps whatever garbage
+/// alpha the pixel shader exported there).
+pub(crate) fn e5_alpha_one() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_E5_ALPHA_ONE").is_some_and(|v| v == "1"))
+}
+
 /// Depth textures the title also asks unordered access for (the console
 /// allows both; the host copy loses the unordered access): how many were
 /// made, and how often such a texture was bound as the depth target,
@@ -1805,9 +1821,13 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+        Some([budget, used, shared_budget, shared_used]) => {
+            let local_ok = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
+                < budget / 100 * room_percent();
+            let shared_ok = shared_budget == 0 || shared_used < shared_budget / 100 * 82;
+            local_ok && shared_ok
         }
         None => filled < WITHOUT_BUDGET,
     }

@@ -216,13 +216,19 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
-    let Some([budget, used, ..]) = video_memory else {
+    let Some([budget, used, shared_budget, shared_used]) = video_memory else {
         return NORMAL_MS;
     };
     if budget == 0 {
         return NORMAL_MS;
     }
-    let used_pct = (u128::from(used) * 100) / u128::from(budget);
+    let local_pct = (u128::from(used) * 100) / u128::from(budget);
+    let shared_pct = if shared_budget > 0 {
+        (u128::from(shared_used) * 100) / u128::from(shared_budget)
+    } else {
+        0
+    };
+    let used_pct = local_pct.max(shared_pct);
     if used_pct >= 85 {
         HIGH_MS
     } else if used_pct >= 75 {
@@ -570,10 +576,12 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let vmem = host().and_then(|h| h.video_memory());
+    let shared_pressured = vmem.is_some_and(|[_, _, sb, su]| sb > 0 && su >= sb / 100 * 78);
+    if crate::residency::pressured() || shared_pressured {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::room(vmem);
     crate::pool::trim();
     crate::list::trim_idle();
     trim_spare();
@@ -747,6 +755,9 @@ pub(crate) fn log_removal_context() {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
+    if let Some(h) = host() {
+        h.log_video_memory("when the host device went");
+    }
     if dred_any() {
         let data = host().map(|h| h.removal_data(&[])).unwrap_or_default();
         tracing::error!("device-removed data{}", if data.is_empty() { "; none" } else { &data });
@@ -9842,6 +9853,17 @@ impl Meter {
                 crate::draw::table_memo_line(frames);
                 crate::draw::list_alias_line(frames);
                 crate::pipeline::library::samplers_line();
+                if let Some([vb, vu, sb, su]) = host().and_then(|h| h.video_memory()) {
+                    tracing::info!(
+                        "video memory now: card {}/{} MB ({}%), shared/GTT {}/{} MB ({}%)",
+                        vu >> 20,
+                        vb >> 20,
+                        if vb > 0 { vu.saturating_mul(100) / vb } else { 0 },
+                        su >> 20,
+                        sb >> 20,
+                        if sb > 0 { su.saturating_mul(100) / sb } else { 0 },
+                    );
+                }
                 for (why, n) in drops.iter().take(12) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

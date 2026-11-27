@@ -883,6 +883,30 @@ fn stale_rule() -> Rule {
     })
 }
 
+/// (DexNom 921d8d3) Keep remap notifications cheap while adjacent/overlapping
+/// ranges arrive; if the queue fills during a pause, fall back to a full rescan
+/// `(0, u64::MAX)` instead of dropping notifications and leaving sparse
+/// textures blank.
+fn record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= end
+        && start <= last.1
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+    } else if ranges.len() >= limit {
+        ranges.clear();
+        ranges.push((0, u64::MAX));
+        return true;
+    } else {
+        ranges.push((start, end));
+    }
+    false
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
 /// about to write it through the kernel (`crate::watch`): the placed
 /// textures there may have arrived, gone, or changed with no descriptor
@@ -899,20 +923,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    if record_remap(&mut ranges, start, end, MOST) {
+        STALE[2].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -4779,6 +4792,14 @@ fn make_twinned(
                     && let Some(desc) = &mut desc
                 {
                     show_prefilled(desc, prefilled);
+                }
+                // (Op-lite/Fox T, `VICTORY_E5_ALPHA_ONE=1`) The console's R9G9B9E5
+                // has no alpha: a read gives 1 (component 3 forced to 1: mapping 0, 1, 2, 5).
+                if crate::resource::e5_alpha_one()
+                    && crate::resource::e5_stand_in(resource)
+                    && let Some(d) = &mut desc
+                {
+                    d.Shader4ComponentMapping = 0 | 1 << 3 | 2 << 6 | 5 << 9 | 1 << 12;
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
