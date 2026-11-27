@@ -769,14 +769,18 @@ fn ahead_gap() -> usize {
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl Iterator<Item = (usize, usize)>) {
     ask_ahead_held(ranges, false);
 }
 
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
-fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+fn ask_ahead_held(ranges: impl Iterator<Item = (usize, usize)>, held: bool) {
+    // The submission's one asking stands ([`ask_once`]). Do not build a
+    // second plan; ranges it does not cover are left to `writes`.
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
         // Not view memory known by its bits or placeholders, and (once
         // tracked) only write-watched memory: the kernel would refuse the
         // asking (and, asked together with others, theirs).
@@ -787,17 +791,12 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
             let (first, last) = (r.0 / PAGE, r.1.div_ceil(PAGE));
             is_watched(first, last) && !PLACEHOLDERS.any(first, last) && !PROTECTED.any(first, last)
         })
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let gap = ahead_gap();
     let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
@@ -1068,7 +1067,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // other threads' askings again (0.5 ms a time, run fills-ab3), and no
     // other asking comes between the two parts.
     let _all = Asking::hold_all();
-    ask_ahead_held(ranges, true);
+    ask_ahead_held(ranges.iter().copied(), true);
     spent.next("asking: the rest");
     ask_rest(ranges, true);
     spent.end();
@@ -2246,6 +2245,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    forget_holes(at, len);
     if len == 0 {
         return;
     }
@@ -2918,7 +2918,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for block in unsure {
         // One question for the blocks of a region.
         if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
+            uncommitted_until = uncommitted_end_cached(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
@@ -3208,7 +3208,21 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     if g.protected.contains(block) {
         return true;
     }
-    if g.left_alone(block) || g.rests(block, rest()) {
+    if g.left_alone(block) {
+        return false;
+    }
+    // (V2, `VICTORY_SOFT_VIEWS`) A view in the runtime's books alone: nothing
+    // writes through it before it is made real, read-only then since it is
+    // held here (made real under this lock, or read-only without it). Guarded
+    // in the books, with no call (the host has a placeholder there and would
+    // refuse, and the guarded view beside it would never be clean).
+    if soft_any(block * BLOCK, BLOCK) {
+        PROTECTED.set(block);
+        g.protected.insert(block);
+        soft_count(SN_GUARD_ALIAS, 1);
+        return true;
+    }
+    if g.rests(block, rest()) {
         return false;
     }
     // Ahead of the protection.
@@ -3274,6 +3288,37 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
+    // (V2, `VICTORY_SOFT_VIEWS`) Views in the runtime's books alone are
+    // guarded there (as in [`protect_alias`]); the runs between them as before.
+    if soft_any(from * BLOCK, (to - from) * BLOCK) {
+        let mut at = from;
+        while at < to {
+            match soft_next(at, to) {
+                Some(soft) if soft == at => {
+                    note(g, at, at + 1);
+                    soft_count(SN_GUARD_HERE, 1);
+                    at += 1;
+                }
+                next => {
+                    let end = next.unwrap_or(to);
+                    protect_plain(g, at, end, &set, &note);
+                    at = end;
+                }
+            }
+        }
+        return;
+    }
+    protect_plain(g, from, to, &set, &note);
+}
+
+/// [`protect_here`] of blocks none of which is in the runtime's books alone.
+fn protect_plain(
+    g: &Guards,
+    from: usize,
+    to: usize,
+    set: &dyn Fn(usize, usize) -> bool,
+    note: &dyn Fn(&Guards, usize, usize),
+) {
     if set(from, to) {
         note(g, from, to);
         return;
@@ -3320,6 +3365,92 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
             }
         }
         block = until;
+    }
+}
+
+/// Holes asked about (`VICTORY_HOLES_ONCE=<frames>`, avatarmanz #377): by
+/// first block, the hole's end ([`uncommitted_end`]) and the frame it was
+/// asked in; no two overlap. Under Wine every `VirtualQuery` walks the region
+/// page by page with the process's memory lock held, and the title's streaming
+/// pools leave holes that refreshes ask about thousands of times a frame. What
+/// the runtime maps, unmaps or commits forgets the holes it touches; a commit
+/// it is not told of shows that many frames later at most.
+static HOLES_ASKED: Mutex<std::collections::BTreeMap<usize, (usize, u64)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// [`uncommitted_end`], or the answer for the hole holding `block` from fewer
+/// than `VICTORY_HOLES_ONCE` frames ago.
+fn uncommitted_end_cached(block: usize) -> usize {
+    let frames = holes_once();
+    if frames == 0 {
+        return uncommitted_end(block);
+    }
+    let frame = crate::frame::current();
+    if let Some((_, &(end, at))) = HOLES_ASKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=block)
+        .next_back()
+        && block < end
+        && frame.saturating_sub(at) < frames
+    {
+        return end;
+    }
+    let end = uncommitted_end(block);
+    if end > block {
+        let mut holes = HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        forget_holes_in(&mut holes, block, end);
+        holes.insert(block, (end, frame));
+    }
+    end
+}
+
+/// How many frames a hole's answer stands (`VICTORY_HOLES_ONCE=<frames>`,
+/// 30 unless given; 0: asked every time, as before).
+fn holes_once() -> u64 {
+    if cfg!(test) {
+        return 0;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HOLES_ONCE") {
+        return if on { 30 } else { 0 };
+    }
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_HOLES_ONCE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(30)
+    })
+}
+
+/// What the runtime maps, unmaps or commits at `[at, at + len)`: the answers
+/// for holes there no longer stand.
+fn forget_holes(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    forget_holes_in(
+        &mut HOLES_ASKED.lock().unwrap_or_else(|e| e.into_inner()),
+        at / BLOCK,
+        at.saturating_add(len).div_ceil(BLOCK),
+    );
+}
+
+/// Takes the holes overlapping blocks `[first, last)` out of `holes`.
+fn forget_holes_in(
+    holes: &mut std::collections::BTreeMap<usize, (usize, u64)>,
+    first: usize,
+    last: usize,
+) {
+    let before = holes
+        .range(..first)
+        .next_back()
+        .filter(|(_, (end, _))| *end > first)
+        .map(|(&start, _)| start);
+    let inside: Vec<usize> = holes.range(first..last).map(|(&start, _)| start).collect();
+    for start in before.into_iter().chain(inside) {
+        holes.remove(&start);
     }
 }
 
@@ -3495,6 +3626,10 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    // (V2, `VICTORY_SOFT_VIEWS`) The kernel's write does not fault into our
+    // handler: views in the runtime's books alone there are made real first.
+    soft_make_real(at, len, SOFT_BY_TITLE_CALL);
+    soft_would_write(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -3674,7 +3809,13 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] Changing);
+
+#[allow(dead_code)]
+enum Changing {
+    Whole(std::sync::RwLockWriteGuard<'static, ()>),
+    Fine(fine::WriteGuard),
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3773,6 +3914,11 @@ static MET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Memory that is not there with no change under way is not waited for.
 fn came_back(at: usize, write: bool) -> bool {
     let there = || {
+        // (V2, `VICTORY_SOFT_VIEWS`) Kept in the books again by the change
+        // waited for: made real.
+        if soft_make_real(at, 1, SOFT_BY_OUR_FAULT) {
+            return true;
+        }
         if !write {
             return readable_view(at);
         }
@@ -3831,31 +3977,361 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    title_memory_remapping_in(&[(0, usize::MAX)])
+}
+
+/// [`title_memory_remapping`] for a change that touches title memory in
+/// `ranges` (start, end) alone: with `VICTORY_MAP_LOCK_FINE=1` reads in
+/// place of other memory go on meanwhile ([`fine`]); without it, as
+/// [`title_memory_remapping`]. Every address whose mapping the change takes
+/// away or makes, even for a moment (the rest of a view unmapped and mapped
+/// again), must be in `ranges`.
+pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
+    install();
+    let changing = if fine::on() {
+        Changing::Fine(fine::write(ranges))
+    } else {
+        Changing::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    };
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Read);
+
+#[allow(dead_code)]
+enum Read {
+    Whole(std::sync::RwLockReadGuard<'static, ()>),
+    Fine(fine::ReadGuard),
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_in(0, usize::MAX)
+}
+
+/// [`title_memory_reading`] of `[at, at + len)` alone: with
+/// `VICTORY_MAP_LOCK_FINE=1` only a change of that memory is waited for.
+pub fn title_memory_reading_in(at: usize, len: usize) -> Reading {
+    if fine::on() {
+        return Reading(Read::Fine(fine::read(at, at.saturating_add(len))));
+    }
+    if let Ok(guard) = MAPPING.try_read() {
+        return Reading(Read::Whole(guard));
+    }
+    let waiting = std::time::Instant::now();
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    fine::waited(waiting);
+    Reading(Read::Whole(guard))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
+    title_memory_reading_now_in(0, usize::MAX)
+}
+
+/// [`title_memory_reading_now`] of `[at, at + len)` alone (see
+/// [`title_memory_reading_in`]).
+pub(crate) fn title_memory_reading_now_in(at: usize, len: usize) -> Option<Reading> {
+    if fine::on() {
+        return fine::try_read(at, at.saturating_add(len)).map(|g| Reading(Read::Fine(g)));
+    }
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+        Ok(guard) => Some(Reading(Read::Whole(guard))),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Read::Whole(e.into_inner()))),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            fine::refused();
+            None
+        }
+    }
+}
+
+/// `VICTORY_MAP_LOCK_FINE=1` (default off): per-range mapping lock so a
+/// mapping change only stalls readers whose range overlaps it.
+pub(crate) mod fine {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::{Condvar, Mutex, MutexGuard};
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_MAP_LOCK_FINE").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    struct State {
+        writer: Option<Vec<(usize, usize)>>,
+        readers: Vec<(usize, usize, u64)>,
+        next: u64,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State { writer: None, readers: Vec::new(), next: 1 });
+    static MOVED: Condvar = Condvar::new();
+    static WRITER: Mutex<()> = Mutex::new(());
+
+    fn state() -> MutexGuard<'static, State> {
+        STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn overlaps(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+        ranges.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    pub(crate) struct ReadGuard(u64);
+
+    impl Drop for ReadGuard {
+        fn drop(&mut self) {
+            let mut s = state();
+            if let Some(i) = s.readers.iter().position(|r| r.2 == self.0) {
+                s.readers.swap_remove(i);
+            }
+            if s.writer.is_some() {
+                MOVED.notify_all();
+            }
+        }
+    }
+
+    pub(crate) struct WriteGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for WriteGuard {
+        fn drop(&mut self) {
+            state().writer = None;
+            MOVED.notify_all();
+        }
+    }
+
+    pub(crate) fn read(from: usize, to: usize) -> ReadGuard {
+        let mut s = state();
+        let mut waiting = None;
+        while s.writer.as_deref().is_some_and(|w| overlaps(w, from, to)) {
+            waiting.get_or_insert_with(std::time::Instant::now);
+            s = MOVED.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        let ticket = s.next;
+        s.next += 1;
+        s.readers.push((from, to, ticket));
+        drop(s);
+        if let Some(waiting) = waiting {
+            self::waited(waiting);
+        } else {
+            N[3].fetch_add(1, Relaxed);
+        }
+        ReadGuard(ticket)
+    }
+
+    pub(crate) fn try_read(from: usize, to: usize) -> Option<ReadGuard> {
+        let mut s = state();
+        if s.writer.as_deref().is_some_and(|w| overlaps(w, from, to)) {
+            drop(s);
+            refused();
+            return None;
+        }
+        let ticket = s.next;
+        s.next += 1;
+        s.readers.push((from, to, ticket));
+        N[3].fetch_add(1, Relaxed);
+        Some(ReadGuard(ticket))
+    }
+
+    pub(crate) fn write(ranges: &[(usize, usize)]) -> WriteGuard {
+        let one = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = state();
+        s.writer = Some(ranges.to_vec());
+        let others = s.readers.iter().any(|r| !overlaps(ranges, r.0, r.1));
+        while s.readers.iter().any(|r| overlaps(ranges, r.0, r.1)) {
+            s = MOVED.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        if others {
+            N[5].fetch_add(1, Relaxed);
+        }
+        drop(s);
+        N[6].fetch_add(1, Relaxed);
+        WriteGuard(one)
+    }
+
+    static N: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+    pub(crate) fn waited(since: std::time::Instant) {
+        let us = since.elapsed().as_micros() as u64;
+        N[0].fetch_add(1, Relaxed);
+        N[1].fetch_add(us, Relaxed);
+        N[2].fetch_max(us, Relaxed);
+    }
+
+    pub(crate) fn refused() {
+        N[4].fetch_add(1, Relaxed);
+    }
+}
+
+/// What the runtime gives for its views in the books alone (`VICTORY_SOFT_VIEWS`).
+pub struct SoftViews {
+    pub read: fn(usize, *mut u8, usize) -> (bool, usize),
+    pub make_real: fn(usize, usize, &dyn Fn(usize) -> bool, u8) -> bool,
+    pub verify: fn(usize, usize) -> (u64, u64),
+}
+
+pub const SOFT_BY_TITLE_FAULT: u8 = 0;
+pub const SOFT_BY_OUR_FAULT: u8 = 1;
+pub const SOFT_BY_OUR_WRITE: u8 = 2;
+pub const SOFT_BY_TITLE_CALL: u8 = 3;
+
+static SOFT_HOOKS: std::sync::OnceLock<SoftViews> = std::sync::OnceLock::new();
+
+/// The runtime keeps views in its books alone ([`SoftViews`]).
+pub fn use_soft_views(hooks: SoftViews) {
+    let _ = SOFT_HOOKS.set(hooks);
+    install();
+}
+
+static SOFT: Bits = Bits::new();
+static SOFT_RO: Bits = Bits::new();
+static WOULD: Bits = Bits::new();
+static SOFT_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WOULD_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn blocks_of(at: usize, len: usize) -> std::ops::Range<usize> {
+    at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)
+}
+
+pub fn soft_view_noted(at: usize, len: usize) {
+    SOFT_ANY.store(true, std::sync::atomic::Ordering::SeqCst);
+    blocks_of(at, len).for_each(|b| SOFT.set(b));
+}
+
+pub fn soft_view_real(at: usize, len: usize) {
+    blocks_of(at, len).for_each(|b| SOFT.clear(b));
+}
+
+pub fn soft_view_gone(at: usize, len: usize) {
+    blocks_of(at, len).for_each(|b| {
+        SOFT.clear(b);
+        SOFT_RO.clear(b);
+    });
+}
+
+pub fn soft_view_would(at: usize, len: usize, on: bool) {
+    if on {
+        WOULD_ANY.store(true, std::sync::atomic::Ordering::SeqCst);
+        blocks_of(at, len).for_each(|b| WOULD.set(b));
+    } else {
+        blocks_of(at, len).for_each(|b| WOULD.clear(b));
+    }
+}
+
+#[inline]
+pub(crate) fn soft_any(at: usize, len: usize) -> bool {
+    len != 0
+        && SOFT_ANY.load(std::sync::atomic::Ordering::Relaxed)
+        && {
+            let r = blocks_of(at, len);
+            SOFT.any(r.start, r.end)
+        }
+}
+
+#[inline]
+pub(crate) fn would_any(at: usize, len: usize) -> bool {
+    len != 0
+        && WOULD_ANY.load(std::sync::atomic::Ordering::Relaxed)
+        && {
+            let r = blocks_of(at, len);
+            WOULD.any(r.start, r.end)
+        }
+}
+
+pub(crate) fn soft_next(first: usize, last: usize) -> Option<usize> {
+    if !SOFT_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    SOFT.set_in(first, last).next()
+}
+
+static SOFT_N: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+const SN_READS: usize = 0;
+const SN_READ_BYTES: usize = 1;
+const SN_GUARD_HERE: usize = 2;
+const SN_GUARD_ALIAS: usize = 3;
+const SN_RO: usize = 4;
+const SN_RO_OPENED: usize = 5;
+const SN_WOULD_READS: usize = 6;
+const SN_WOULD_BYTES: usize = 7;
+const SN_SAME: usize = 8;
+const SN_DIFFER: usize = 9;
+const SN_WOULD_WRITES: usize = 10;
+
+fn soft_count(what: usize, n: u64) {
+    SOFT_N[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn soft_view_counts() -> [u64; 11] {
+    std::array::from_fn(|i| SOFT_N[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+pub(crate) fn soft_read(at: usize, to: *mut u8, len: usize) -> Option<(bool, usize)> {
+    let hooks = SOFT_HOOKS.get()?;
+    let (books, n) = (hooks.read)(at, to, len);
+    if books && n != 0 {
+        soft_count(SN_READS, 1);
+        soft_count(SN_READ_BYTES, n as u64);
+    }
+    Some((books, n))
+}
+
+pub(crate) fn soft_verify(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !would_any(at, len) {
+        return;
+    }
+    soft_count(SN_WOULD_READS, 1);
+    soft_count(SN_WOULD_BYTES, len as u64);
+    static WINDOW: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let now = crate::host::now_ms() / 1000;
+    if WINDOW[0].swap(now, Relaxed) != now {
+        WINDOW[1].store(0, Relaxed);
+    }
+    if WINDOW[1].fetch_add(len as u64, Relaxed) > 64 << 20 {
+        return;
+    }
+    if let Some(hooks) = SOFT_HOOKS.get() {
+        let (same, differ) = (hooks.verify)(at, len);
+        soft_count(SN_SAME, same);
+        soft_count(SN_DIFFER, differ);
+    }
+}
+
+pub(crate) fn soft_would_write(at: usize, len: usize) {
+    if would_any(at, len) {
+        soft_count(SN_WOULD_WRITES, 1);
+    }
+}
+
+pub fn soft_make_real(at: usize, len: usize, by: u8) -> bool {
+    if !soft_any(at, len) {
+        return false;
+    }
+    let Some(hooks) = SOFT_HOOKS.get() else {
+        return false;
+    };
+    match GUARDS.try_read() {
+        Ok(g) => (hooks.make_real)(at, len, &|block| g.protected.contains(block) || PROTECTED.any(block, block + 1), by),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            let g = e.into_inner();
+            (hooks.make_real)(at, len, &|block| g.protected.contains(block) || PROTECTED.any(block, block + 1), by)
+        }
+        Err(std::sync::TryLockError::WouldBlock) => (hooks.make_real)(
+            at,
+            len,
+            &|block| {
+                SOFT_RO.set(block);
+                soft_count(SN_RO, 1);
+                true
+            },
+            by,
+        ),
     }
 }
 
@@ -3870,6 +4346,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    forget_holes(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -3880,6 +4357,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    forget_holes(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
@@ -3907,6 +4385,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 pub fn title_memory_freed(at: usize, len: usize) {
     let first = at / BLOCK;
     if len != 0 {
+        forget_holes(at, len);
         forget_views(first, at.saturating_add(len).div_ceil(BLOCK));
         clear_placeholders(first, at.saturating_add(len).div_ceil(BLOCK));
     } else {
@@ -3937,7 +4416,18 @@ pub fn title_memory_freed(at: usize, len: usize) {
         }
     }
     let mut g = guards();
-    let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
+    let opened_first = {
+        let opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
+        opened.keys().copied().filter(|&b| b >= first).min()
+    };
+    let noted = [
+        g.protected.range(first..).next(),
+        g.absent.range(first..).next(),
+        g.foreign.range(first..).next().copied(),
+        g.aliased.range(first..).next(),
+        BESIDE.set_in(first, usize::MAX).next(),
+        opened_first,
+    ];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
     };
@@ -3959,6 +4449,19 @@ pub fn title_memory_freed(at: usize, len: usize) {
     let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
     for block in foreign {
         g.foreign.remove(&block);
+    }
+    let aliased: Vec<usize> = g.aliased.range(first..end).collect();
+    for block in aliased {
+        g.aliased.remove(block);
+    }
+    for block in BESIDE.set_in(first, end) {
+        BESIDE.clear(block);
+    }
+    {
+        let mut opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
+        if !opened.is_empty() {
+            opened.retain(|block, _| !(first..end).contains(block));
+        }
     }
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
@@ -4019,9 +4522,18 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'s
     for block in foreign {
         g.foreign.remove(&block);
     }
-    let aliased: Vec<usize> = g.aliased.range(range).collect();
+    let aliased: Vec<usize> = g.aliased.range(range.clone()).collect();
     for block in aliased {
         g.aliased.remove(block);
+    }
+    for block in BESIDE.set_in(range.start, range.end) {
+        BESIDE.clear(block);
+    }
+    {
+        let mut opened = g.opened.lock().unwrap_or_else(|e| e.into_inner());
+        if !opened.is_empty() {
+            opened.retain(|block, _| !range.contains(block));
+        }
     }
     g
 }
@@ -4040,6 +4552,23 @@ pub(crate) fn install() {
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        // (V2, `VICTORY_SOFT_VIEWS`) A touch of a view in the runtime's books
+        // alone, any kind and anyone's (our safe copies' too, which would
+        // otherwise fail): made real, and the access made again. First, so
+        // that nothing below takes it for memory that is not there.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && soft_any(r.ExceptionInformation[1], 1)
+        {
+            let by = if crate::safecopy::failing_exit(r.ExceptionAddress as usize).is_some() {
+                SOFT_BY_OUR_FAULT
+            } else {
+                SOFT_BY_TITLE_FAULT
+            };
+            if soft_make_real(r.ExceptionInformation[1], 1, by) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
         const READ: usize = 0;
         const WRITE: usize = 1;
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
@@ -4083,6 +4612,25 @@ pub(crate) fn install() {
             && crate::titlewrite::store(unsafe { &mut *context }, at)
         {
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // (V2, `VICTORY_SOFT_VIEWS`) A view made real read-only for want of
+        // the guards' lock ([`soft_make_real`]) that the guards do not hold:
+        // read-write, as it would have been made. Under the guards' lock, so
+        // that no guard of it is being made meanwhile.
+        if SOFT_RO.any(block, block + 1) {
+            use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+            let g = guards();
+            if !g.protected.contains(block) && !PROTECTED.any(block, block + 1) && SOFT_RO.clear_was(block) {
+                let mut old = 0;
+                // SAFETY: a view the runtime mapped read-only for us; only its
+                // protection changes.
+                let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+                drop(g);
+                if done {
+                    soft_count(SN_RO_OPENED, 1);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
         }
         // Another thread may have opened the block since this one faulted
         // (then nothing waits for the lock), and a copy may have guarded it
@@ -4612,11 +5160,12 @@ mod tests {
         assert_ne!(p, 0);
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
-        ask_ahead(&ranges);
+        ask_ahead(ranges.into_iter());
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges, false);
+        ask_ahead(std::iter::from_fn(|| panic!("a kept asking must not consume another range plan")));
         let last = journal().notes.range(p / PAGE + 1, p / PAGE + 2).first().map(|n| n.1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");

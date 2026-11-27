@@ -1178,6 +1178,8 @@ pub(crate) struct HostTexture {
     pub(crate) base: u32,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
+    /// (`VICTORY_PARTIAL_DELTA=1`) Uploads recorded into this host copy.
+    pub(crate) uploads: std::sync::atomic::AtomicU32,
     /// Made in place of one with fewer levels: the slots that show that one
     /// are made again once this one was filled whole.
     pub(crate) grown: std::sync::atomic::AtomicBool,
@@ -1276,12 +1278,48 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// (Belobug e942896 / VIctory-vitesse) How many of a streamed placed 2D
+/// texture's largest mips to skip so no side passes `VICTORY_TEXTURE_MAX`
+/// (0: uncapped; unset: 1024, then 512 from 92 % of the VRAM budget and
+/// 256 from 97 %). Keeps 16 GB cards from filling VRAM and stalling
+/// thousands of textures.
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if set == Some(0) {
+        return 0;
+    }
+    let percent = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .filter(|m| m[0] > 0)
+        .map_or(0, |m| m[1].saturating_mul(100) / m[0]);
+    let max = set.unwrap_or_else(|| match percent {
+        0..92 => 1024,
+        92..97 => 512,
+        _ => 256,
+    });
+    let mut skip = 0u32;
+    while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
+        if skip + 1 >= u32::from(desc.mip_levels) {
+            break;
+        }
+        skip += 1;
+    }
+    skip
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`]; block-compressed
-/// formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1424,6 +1462,25 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`alias_of`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1453,7 +1510,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1514,7 +1571,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    // Pinned under the lock: once it is let go, the title can drop its last
+    // reference, and the caller's alias copy still needs the texture.
+    if !same || !crate::object::add_ref_alive(other) {
+        return None;
+    }
+    Some(Held(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1617,13 +1679,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // pick by index among them.
         let mut base = 0;
         let mut prefill = None;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
             // The store has its larger levels: made whole at once.
             if base > 0
                 && tiled.is_none()
@@ -2344,6 +2404,7 @@ impl HostTexture {
             tiled: None,
             base: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
+            uploads: Default::default(),
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
@@ -2371,6 +2432,7 @@ impl HostTexture {
             tiled: Some(tiled),
             base: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            uploads: Default::default(),
             grown: Default::default(),
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
@@ -2391,6 +2453,7 @@ impl Drop for HostTexture {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
         }
+        crate::texture::delta::forget(self.serial);
     }
 }
 
@@ -2516,6 +2579,15 @@ fn host_texture_as(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // (Scarlett D1, `VICTORY_SRGB_VIEWS`) Plain textures in formats with an
+    // sRGB twin get a typeless host copy so sRGB views preserve sRGB decode.
+    const TARGET_OR_DEPTH: u32 = 1 | 2;
+    if crate::silent::srgb_views()
+        && d.flags & (TARGET_OR_DEPTH | UNORDERED) == 0
+        && let Some(typeless) = crate::silent::srgb_typeless(d.format)
+    {
+        d.format = typeless;
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -2626,6 +2698,7 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
+#[derive(Clone)]
 pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
 
 // SAFETY: the host texture is named only in queue calls, which any thread

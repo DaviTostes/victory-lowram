@@ -121,11 +121,23 @@ pub(crate) fn limited_host_ram() -> bool {
     })
 }
 
+fn pressure_free_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_RESIDENCY_FREE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(3 * GIB, |mb| mb * MIB)
+    })
+}
+
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    let low = pressure_free_bytes();
+    let high = low.saturating_add(low.min(2 * GIB));
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < high || commit < 6 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= low || commit <= 4 * GIB
     }
 }
 

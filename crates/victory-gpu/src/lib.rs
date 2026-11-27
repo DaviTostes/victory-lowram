@@ -83,6 +83,8 @@ mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
+mod silent;
+#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
@@ -132,7 +134,10 @@ pub fn frames_begun() -> u64 {
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_placeholder, title_memory_reading,
-    title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
-    title_memory_watched, title_memory_written, writing as kernel_will_write,
+    SOFT_BY_OUR_FAULT, SOFT_BY_OUR_WRITE, SOFT_BY_TITLE_CALL, SOFT_BY_TITLE_FAULT, SoftViews, kernel_writing,
+    soft_make_real, soft_view_counts, soft_view_gone, soft_view_noted, soft_view_real, soft_view_would,
+    title_memory_allocated, title_memory_freed, title_memory_placeholder, title_memory_reading,
+    title_memory_reading_in, title_memory_remapped, title_memory_remapping, title_memory_remapping_in,
+    title_memory_splitting, title_memory_unmapping, title_memory_watched, title_memory_written, use_soft_views,
+    writing as kernel_will_write,
 };

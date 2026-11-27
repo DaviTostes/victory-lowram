@@ -499,9 +499,8 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
-/// Draws and dispatches dropped since the last [`take_drops`], by reason
-/// (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Draws and dispatches dropped since the last [`take_drops`], by reason.
+#[cfg(windows)]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
@@ -538,12 +537,15 @@ pub(super) fn skipped_shaders(shaders: &[Arc<Shader>]) -> Option<&str> {
     if let Some(shader) = shaders.iter().find(|shader| hashes.contains(&shader.hash)) {
         return Some(shader.hash.as_str());
     }
-    // Without the BVH builder (`VICTORY_BVH_BUILDER=1`), running
-    // `CS_ScreenProbes_ActivateRays` with no rays behind it destroys light,
-    // shadows and reflections (ported from Belobug/VIctory-Belobug-AMD 6986a57).
-    static BVH_ALLOWED: OnceLock<bool> = OnceLock::new();
-    let bvh = *BVH_ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"));
-    if !bvh {
+    // Optional opt-in (`VICTORY_ACTIVATE_RAYS=0`) to skip `CS_ScreenProbes_ActivateRays`
+    // when the BVH builder is off. Default is enabled (1) per RYUKI-7900XT 362f600:
+    // skipping it left stale probe memory that produced dark/purple shadows under ambient stand-in.
+    static SKIP_ACTIVATE: OnceLock<bool> = OnceLock::new();
+    let skip_activate = *SKIP_ACTIVATE.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0")
+    });
+    if skip_activate {
         const ACTIVATE_RAYS: &[u8] = b"CS_ScreenProbes_ActivateRays";
         if let Some(shader) = shaders.iter().find(|s| {
             s.stage == "compute" && s.container.windows(ACTIVATE_RAYS.len()).any(|w| w == ACTIVATE_RAYS)
@@ -554,7 +556,7 @@ pub(super) fn skipped_shaders(shaders: &[Arc<Shader>]) -> Option<&str> {
     None
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     skipped_shaders(&p.shaders)
 }
@@ -565,8 +567,8 @@ pub(crate) fn is_skipped(this: This) -> bool {
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// for want of a host pipeline.
+#[cfg(windows)]
 pub(crate) fn note_drop(this: This) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
@@ -581,16 +583,17 @@ pub(crate) fn note_drop(this: This) {
     }
 }
 
-/// Counts a draw or dispatch dropped for `why` (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Counts a draw or dispatch dropped for `why`.
+#[cfg(windows)]
 pub(crate) fn note_why(why: String) {
+    #[cfg(feature = "diagnostics")]
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
-/// The drops counted since the last call, most first (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The drops counted since the last call, most first.
+#[cfg(windows)]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
@@ -812,7 +815,7 @@ pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
-mod library;
+pub(crate) mod library;
 #[cfg(windows)]
 mod make;
 

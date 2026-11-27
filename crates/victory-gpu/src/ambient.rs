@@ -102,12 +102,58 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
+        Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        set => set,
+    })
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// (avatarmanz 77137b9) With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`):
+/// keeps the title's traced diffuse light between `least` and `most` times our
+/// estimate so RT mode avoids both pitch-black dark rooms and blown-out white
+/// blotches on RDNA4.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Band {
+    least: f32,
+    most: f32,
+    level: f32,
+}
+
+pub(crate) fn rt_band() -> Option<Band> {
+    static SET: OnceLock<Option<Band>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let band = parse_band(&std::env::var("VICTORY_AMBIENT_RT").ok()?)?;
+        tracing::info!(
+            least = band.least,
+            most = band.most,
+            level = band.level,
+            "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)"
+        );
+        Some(band)
+    })
+}
+
+fn parse_band(set: &str) -> Option<Band> {
+    let mut parts = set
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
+    let least = parts.next().flatten()?;
+    let most = parts.next().flatten().unwrap_or(4.0).max(least).max(1e-3);
+    let level = parts.next().flatten().filter(|v| *v > 0.0).unwrap_or(0.8);
+    Some(Band { least, most, level })
+}
+
+/// Whether the stand-in is on: set, and the title's rays find nothing (or the
+/// hybrid RT band is requested).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && (rt_band().is_some() || !crate::pipeline::builder_runs())
+}
+
+fn bounds() -> (f32, f32) {
+    match rt_band() {
+        Some(b) if crate::pipeline::builder_runs() => (b.least, b.most),
+        _ => (1.0, 4.0),
+    }
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -204,6 +250,24 @@ fn frame_ms(role: Role) -> f32 {
     dt
 }
 
+/// Minimum indirect diffuse light floor at night/dark scenes so unlit ground
+/// and shadowed surfaces do not crush to pitch black when screen-space
+/// radiance is near zero (`VICTORY_AMBIENT_FLOOR=<level>`; default `0.06`,
+/// `0` disables). Uses cool moonlight tint `[0.65, 0.78, 1.0]` modulated by
+/// depth crease AO.
+fn night_floor() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_AMBIENT_FLOOR") {
+        Ok(set) => set
+            .trim()
+            .parse()
+            .ok()
+            .filter(|v: &f32| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.06),
+        Err(_) => 0.06,
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -227,10 +291,12 @@ const SOURCE: &str = r#"
 #define PY 90
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
-    float near; float tan_y; uint width; uint height;
+    float floor_min; float least; uint width; uint height;
     float follow; float most; float air; uint probe;
     float jump; float fresh; float dt; uint slices;
 };
+static const float near = 0.1;
+static const float tan_y = 0.45;
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
@@ -444,6 +510,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // Keep dark night scenes and shadowed ground from crushing to pitch black:
+    // cool moonlight floor (Belobug/VItoriaBr hue) shaded by depth crease AO.
+    if (floor_min > 0.0) {
+        float3 night = float3(0.65, 0.78, 1.0) * floor_min * open;
+        found = max(found, night);
+    }
     float3 was = unpack(light[p]);
     // Magenta (green far below red and blue) is what the probes' memory held, not light.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
@@ -457,7 +529,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    float3 written = max(was, found);
+    float3 written = max(was, found * least);
     light[p] = pack(written);
     if (probe != 0 && (at.x & 15) == 0 && (at.y & 15) == 0) {
         uint ignored;
@@ -641,7 +713,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     list.keep(&pass.stats);
     let [strength, radius] = shade();
-    let floats = [level, constant, strength, radius, 0.1, 0.45];
+    let (least, most) = bounds();
+    let floats = [level, constant, strength, radius, night_floor(), least];
     let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
@@ -649,7 +722,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most.to_bits();
     words[10] = if role == Role::Reflect { reflect_cap() } else { air() }.to_bits();
     words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();

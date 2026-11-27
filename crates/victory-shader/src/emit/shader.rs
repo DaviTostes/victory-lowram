@@ -106,6 +106,8 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil ([`super::lower::early_depth`]).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -256,6 +258,10 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// The part of [`Self::lds_dwords`] the console program declares, in
+    /// dwords; the layer's own dwords (lane exchange, wave order) follow it.
+    /// LDS instructions reach only this part, as on the console.
+    pub lds_title_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -309,6 +315,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            lds_title_dwords: 0,
             lds: None,
             main,
             entry,

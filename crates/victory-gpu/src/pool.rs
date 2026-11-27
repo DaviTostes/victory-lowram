@@ -51,7 +51,11 @@ pub(crate) fn trim() {
     let t = now();
     {
         let mut st = lock(&STAGING);
-        st.most = staging_kept();
+        st.most = if staging_pack() {
+            STAGING_PACKED_KEPT.min(staging_kept())
+        } else {
+            staging_kept()
+        };
         st.rested(t);
     }
     lock(&TEXTURES).rested(t);
@@ -100,6 +104,38 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
+
+/// Milliseconds until a piece of a staging block given back is used again
+/// (`VICTORY_STAGING_REST_MS`; unset: [`REST`]). A staging piece comes back
+/// only when the last host list that recorded its copy is reset, so the GPU
+/// is already done reading it; the rest is a second guard only.
+fn staging_rest() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = std::env::var("VICTORY_STAGING_REST_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(REST);
+        if ms != REST {
+            tracing::info!(
+                ms,
+                "staging pieces rest {ms} ms before they are used again (VICTORY_STAGING_REST_MS; default {REST})"
+            );
+        }
+        ms
+    })
+}
+
+/// `VICTORY_STAGING_PACK=1`: a staging piece goes into the fullest block it
+/// fits, and at most [`STAGING_PACKED_KEPT`] empty staging blocks stay, so
+/// sparse blocks empty and are released back to the OS.
+fn staging_pack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_STAGING_PACK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Empty staging blocks kept with [`staging_pack`] (128 MiB).
+const STAGING_PACKED_KEPT: usize = 2;
 
 fn now() -> u64 {
     crate::host::now_ms()
@@ -193,6 +229,13 @@ impl Ranges {
     fn whole(&self, size: u64) -> bool {
         self.0.get(&0) == Some(&size)
     }
+
+    fn fits(&self, len: u64, align: u64) -> bool {
+        self.0.iter().any(|(&start, &size)| {
+            let at = start.next_multiple_of(align);
+            at + len <= start + size
+        })
+    }
 }
 
 /// A part of a block.
@@ -206,6 +249,8 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// Free bytes left in [`Self::free`].
+    room: u64,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -227,11 +272,27 @@ struct Pool<B> {
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
+    /// Empty blocks released since the start.
+    given_back: u64,
+    /// Pieces go into the fullest block they fit.
+    pack: bool,
+    /// Milliseconds a piece given back rests ([`REST`]; staging:
+    /// [`staging_rest`]).
+    rest: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool {
+            blocks: Vec::new(),
+            resting: VecDeque::new(),
+            spare: 0,
+            most,
+            retry_growth_at: 0,
+            given_back: 0,
+            pack: false,
+            rest: REST,
+        }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -257,13 +318,32 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+        if self.pack {
+            let mut best: Option<(u64, usize)> = None;
+            for (i, block) in self.blocks.iter().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && block.room >= len
+                    && best.is_none_or(|(room, _)| block.room < room)
+                    && block.free.fits(len, align)
+                {
+                    best = Some((block.room, i));
+                }
+            }
+            if let Some((_, i)) = best
+                && let Some(start) = self.blocks[i].as_mut().and_then(|b| b.free.take(len, align))
             {
                 found = Some((i, start));
-                break;
+            }
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -296,6 +376,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         let block = self.blocks[i].as_mut()?;
+        block.room = block.room.saturating_sub(len);
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
@@ -323,12 +404,13 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] =
+            Some(Block { memory, free: Ranges::new(BLOCK), room: BLOCK, used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + self.rest, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -347,6 +429,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                block.room = block.room.saturating_add(piece.len).min(BLOCK);
                 any |= block.free.whole(BLOCK);
             }
         }
@@ -360,6 +443,7 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.given_back += 1;
                     }
                 }
             }
@@ -416,7 +500,13 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut pool = lock(&STAGING);
+    pool.rest = staging_rest();
+    if staging_pack() {
+        pool.pack = true;
+        pool.most = STAGING_PACKED_KEPT.min(staging_kept());
+    }
+    let taken = pool.take(bytes, 512, now(), || {
         // (`VICTORY_RESIDENCY=1`: no new block for a texture picked by index
         // while commit is short; those a draw samples now still get one.)
         let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
@@ -426,7 +516,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    });
+    drop(pool);
+    let (piece, memory, again) = taken?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -845,6 +937,40 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
         let mut none: Pool<u32> = Pool::new(SPARE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
+    }
+
+    #[test]
+    fn a_shorter_rest_and_packing_let_a_staging_block_empty() {
+        let mut pool: Pool<u32> = Pool::new(STAGING_PACKED_KEPT);
+        pool.rest = 250;
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let (a, _, _) = pool.take(BLOCK / 2, 512, 0, make).unwrap();
+        let (b, _, _) = pool.take(BLOCK / 2, 512, 0, make).unwrap();
+        let (c, _, _) = pool.take(BLOCK / 4, 512, 0, make).unwrap();
+        assert_eq!((a.block, b.block), (0, 0));
+        assert_eq!(c.block, 1);
+        pool.give(a, 100);
+        // Not before its own rest, then at once.
+        let (d, _, _) = pool.take(BLOCK / 4, 512, 100 + 249, make).unwrap();
+        assert_eq!(d.block, 1, "first fit: block 1 has room, block 0's half rests");
+        let (e, _, again) = pool.take(BLOCK / 4, 512, 100 + 250, make).unwrap();
+        assert_eq!((e.block, e.start, again), (0, 0, true));
+        // Packed: the fullest block that fits takes the piece (block 1 holds
+        // a half, block 0 three quarters).
+        pool.pack = true;
+        let (f, _, _) = pool.take(BLOCK / 8, 512, 400, make).unwrap();
+        assert_eq!(f.block, 0);
+        // Block 1 given back whole goes at once past the kept ones.
+        pool.most = 0;
+        pool.give(c, 500);
+        pool.give(d, 500);
+        pool.rested(750);
+        assert_eq!(pool.blocks(), 1);
+        assert_eq!(pool.given_back, 1);
     }
 
     #[test]

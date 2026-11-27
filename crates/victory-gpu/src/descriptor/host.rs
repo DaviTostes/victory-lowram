@@ -1391,6 +1391,16 @@ fn view_bytes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BYTES").is_none_or(|v| v != "0"))
 }
 
+/// Whether every non-16-byte buffer view should be forced onto its own
+/// `shadow::exact` copy when `move_raw` cannot patch CPU descriptors in place
+/// (`VICTORY_RAW_TWIN_EXACT=1`, off by default: routing all ~2,200/frame
+/// non-16-byte structured/typed views through `shadow::exact` creates >8,000
+/// extra D3D12 buffers and adds ~60 ms/frame in copies + heap buffers on Wine).
+fn raw_twin_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_TWIN_EXACT").is_some_and(|v| v == "1"))
+}
+
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
 /// its buffer has, or one of the view's own bytes ([`off_elements`]).
 fn view_home(
@@ -1412,7 +1422,8 @@ fn view_home(
         probe_view_limit();
     }
     let has_raw_twins = victory_shader::emit::raw_views() != 0;
-    if !off_elements(offset, stride, raw, element, has_raw_twins) {
+    let raw_twin_off16 = has_raw_twins && raw_twin_exact() && !offset.is_multiple_of(16);
+    if !raw_twin_off16 && !off_elements(offset, stride, raw, element, has_raw_twins) {
         return shadow;
     }
     crate::shadow::exact(start, len).unwrap_or(shadow)
@@ -2949,6 +2960,29 @@ impl HostHeap {
     /// ([`ListViews`]). What is known of the record in this recording;
     /// `None` (the slot is not made): not a view kept so.
     pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        self.make_listed_in(recording, words, index, None)
+    }
+
+    /// (`VICTORY_LIST_HOLD=1` / `VICTORY_LIST_BATCH=1`) As [`HostHeap::make_listed`],
+    /// keeping each view's resource once per recording on the list instead of per
+    /// slot, and optionally batching descriptor copies into one `CopyDescriptors`.
+    pub(crate) fn make_listed_batched(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        batch: &mut CopyBatch,
+    ) -> Option<Listed> {
+        self.make_listed_in(recording, words, index, Some(batch))
+    }
+
+    fn make_listed_in(
+        &self,
+        recording: u64,
+        words: [u32; 3],
+        index: u32,
+        mut batch: Option<&mut CopyBatch>,
+    ) -> Option<Listed> {
         if self.sampler {
             return None;
         }
@@ -2978,17 +3012,51 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                views.made.insert(words, ListView { view, at, twin, kept, listed, list_kept: false });
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
+            let at = views.made.get(&words)?.at;
+            let (slot0, slot1) = (views.slot(at), views.slot(at + 1));
+            let made = views.made.get_mut(&words)?;
+            match batch.as_deref_mut() {
+                None => {
+                    self.copy_from(index, slot0);
+                    if made.twin && twins {
+                        self.copy_from(self.raw + index, slot1);
+                        self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.clear_twin(index);
+                    }
+                    self.keep(index, made.kept.clone());
+                }
+                Some(batch) => {
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(written) = self.written.get(index as usize) {
+                        written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if batch.now {
+                        self.copy_from(index, slot0);
+                        if made.twin && twins {
+                            self.copy_from(self.raw + index, slot1);
+                        }
+                    } else {
+                        batch.copies.push((self.cpu(index), slot0));
+                        if made.twin && twins {
+                            batch.copies.push((self.cpu(self.raw + index), slot1));
+                        }
+                    }
+                    if made.twin && twins {
+                        self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.clear_twin(index);
+                    }
+                    if !made.list_kept {
+                        made.list_kept = true;
+                        if let Some(kept) = &made.kept {
+                            batch.keep.push(kept.clone());
+                        }
+                    }
+                }
             }
-            self.keep(index, made.kept.clone());
             Some(made.listed)
         })
     }
@@ -3724,6 +3792,64 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+/// (fxceless #927) The unsigned integer format with the layout of a 16-bit
+/// float or signed integer format (one, two or four channels), if `format`
+/// is one.
+pub(crate) fn half_format(format: u32) -> Option<u32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// (fxceless #927) `view` as a shader is shown it where it moves a buffer's
+/// 16-bit channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`): a buffer view in a
+/// 16-bit float or signed format, in the unsigned format of the same layout,
+/// through which every 16-bit pattern is read and stored as it is. `None`
+/// for every other view: the title's own serves.
+pub(crate) fn half_view(view: &View) -> Option<View> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Shader(*resource, Some(desc)))
+        }
+        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Unordered(*resource, *counter, Some(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Placed(*unordered, *resource, desc))
+        }
+        _ => None,
+    }
+}
+
+/// (fxceless #927) The format of `view` if moving 16-bit channels as
+/// unsigned integers is not what the console gives.
+pub(crate) fn half_inexact(view: &View) -> Option<u32> {
+    const BUFFER: u32 = 1;
+    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
+    let format = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => {
+            desc[0]
+        }
+        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
+        _ => return None,
+    };
+    (!EXACT.contains(&format)).then_some(format)
 }
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -4526,6 +4652,27 @@ fn make_twinned(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
                 );
+                // (Scarlett D1, `VICTORY_CBV_OWN_COPY`) Aligned own copy filled
+                // immediately so unaligned CBVs do not read zeros.
+                if crate::silent::cbv_own_copy()
+                    && let Some(own) = crate::shadow::exact(address, u64::from(size))
+                    && own.gpu(address) % 256 == 0
+                {
+                    own.fill_now();
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                        BufferLocation: own.gpu(address),
+                        SizeInBytes: constant_bytes(size),
+                    };
+                    // SAFETY: slots of our heap; `own` is a 256-byte-aligned copy.
+                    unsafe {
+                        device.CreateConstantBufferView(Some(&desc), at);
+                        if let Some(twin) = twin {
+                            device.CreateConstantBufferView(Some(&desc), twin);
+                        }
+                    }
+                    crate::silent::add(crate::silent::k::CBV_OWN, 1);
+                    return Some(Some(own.buffer.clone()));
+                }
                 return None;
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -4570,6 +4717,26 @@ fn make_twinned(
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                // (Scarlett D1, `VICTORY_SRGB_VIEWS`) Typeless host copy of a
+                // plain UNORM/sRGB texture: fill in the title's format when the
+                // view omitted one so the host does not reject a typeless SRV.
+                if crate::silent::srgb_views()
+                    && let Some(own) = crate::resource::view_format(resource)
+                    && crate::silent::srgb_typeless(own).is_some()
+                {
+                    match desc.as_mut() {
+                        Some(d) if d.Format.0 == 0 => d.Format = DXGI_FORMAT(own as i32),
+                        Some(_) => {}
+                        None => desc = whole_srv(texture, own),
+                    }
+                    if desc.as_ref().is_some_and(|d| {
+                        crate::silent::SRGB_PAIRS
+                            .iter()
+                            .any(|&(_, s)| s == d.Format.0 as u32)
+                    }) {
+                        crate::silent::add(crate::silent::k::SRGB_KEPT, 1);
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -4602,7 +4769,9 @@ fn make_twinned(
                 if copy.base > 0
                     && let Some(desc) = &mut desc
                 {
-                    from_base(desc, copy.base);
+                    // SAFETY: a live resource.
+                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    from_base(desc, copy.base, own_mips);
                 }
                 // Made whole from the store: all its levels.
                 let prefilled = copy.prefilled.load(std::sync::atomic::Ordering::Relaxed);
@@ -4706,20 +4875,27 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                // Each texture is said once (the first 64), with how many times
-                // such a view was asked for so far: what shaders write through
-                // them is lost.
+                // (Scarlett D1, `VICTORY_PLACED_UAV`) Mirror unordered access
+                // views of placed textures onto the same host texture their
+                // shader views read (`texture_at`). Address 0 is the title's
+                // null view.
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if address == 0 {
+                    crate::silent::add(crate::silent::k::PLACED_UAV_ZERO, 1);
+                    return None;
+                }
+                if let Some(mirrored) = placed_unordered_texture(view).and_then(|v| make(&v, at)) {
+                    crate::silent::add(crate::silent::k::PLACED_UAV_MADE, 1);
+                    return Some(mirrored);
+                }
+                crate::silent::add(crate::silent::k::PLACED_UAV_NULL, 1);
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
+                if (said.len() < 64 && said.insert(address)) || times.is_power_of_two() {
                     tracing::warn!(
-                        address = format_args!("{at:#x}"),
+                        address = format_args!("{address:#x}"),
                         times,
                         "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
                         &desc[..10]
@@ -4766,18 +4942,39 @@ fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
 /// is left out.
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+    let clamp_mips = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if own_mips > 0 {
+            *most = (*most).min(own_mips - 1);
+        }
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).max(1);
+            if own_mips > 0 {
+                *levels = (*levels).min(own_mips.saturating_sub(*most)).max(1);
+            }
+        }
+        *lod = (*lod - base as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        _ => {}
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5111,6 +5308,90 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
+/// (Scarlett D1, `VICTORY_PLACED_UAV`) An unordered access view of a texture
+/// the title placed in memory itself, on the same host resource its shader
+/// views read (`texture_at`).
+pub(crate) fn placed_unordered_texture(view: &View) -> Option<View> {
+    const BUFFER: u32 = 1;
+    const UNORDERED: u32 = 4;
+    let View::Placed(true, resource, desc) = view else {
+        return None;
+    };
+    if resource[0] == BUFFER || resource[12] & UNORDERED == 0 || !crate::silent::placed_uav() {
+        return None;
+    }
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    if address == 0 {
+        return None;
+    }
+    let texture = crate::resource::texture_at(address, resource)?;
+    Some(View::Unordered(texture as usize, 0, desc[..10].try_into().ok()))
+}
+
+/// (Scarlett D1, `VICTORY_SRGB_VIEWS`) Whole-resource shader view of a typeless
+/// host copy in the title's `format`, when the title passed a null SRV desc.
+fn whole_srv(texture: &ID3D12Resource, format: u32) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let layers = u32::from(d.DepthOrArraySize);
+    let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT(format as i32),
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match (d.Dimension, layers > 1, d.SampleDesc.Count > 1) {
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, false, _) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            view.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MipLevels: u32::MAX,
+                ..Default::default()
+            };
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, true, _) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+            view.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MipLevels: u32::MAX,
+                ArraySize: layers,
+                ..Default::default()
+            };
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, false, false) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            view.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MipLevels: u32::MAX,
+                ..Default::default()
+            };
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, true, false) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            view.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MipLevels: u32::MAX,
+                ArraySize: layers,
+                ..Default::default()
+            };
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, false, true) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, true, true) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            view.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                ArraySize: layers,
+                ..Default::default()
+            };
+        }
+        (D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..) => {
+            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            view.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MipLevels: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => return None,
+    }
+    Some(view)
+}
+
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
@@ -5305,7 +5586,7 @@ mod tests {
         let view = |first, levels, clamp| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3);
+            from_base(&mut desc, 3, 10);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
@@ -6317,6 +6598,74 @@ struct ListView {
     twin: bool,
     kept: Kept,
     listed: Listed,
+    /// (`VICTORY_LIST_HOLD` / `VICTORY_LIST_BATCH`) The list of this recording holds `kept`.
+    list_kept: bool,
+}
+
+/// (`VICTORY_LIST_HOLD=1` / `VICTORY_LIST_BATCH=1`) Reused per-table batch for
+/// descriptor copies and per-recording resource holds.
+#[derive(Default)]
+pub(crate) struct CopyBatch {
+    copies: Vec<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)>,
+    pub(crate) keep: Vec<ID3D12Resource>,
+    /// (`VICTORY_LIST_HOLD=1`) Copy immediately one-by-one; only defer holds to the list.
+    pub(crate) now: bool,
+}
+
+/// `VICTORY_LIST_HOLD=1` (default off): hold a view's resource once per list
+/// (`HostList::keep`) instead of per dynamic slot (spares Mutex + AddRef/Release).
+pub(crate) fn list_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_HOLD").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_LIST_BATCH=1` (default off): batch per-table descriptor copies into
+/// one `CopyDescriptors` call in addition to [`list_hold`].
+pub(crate) fn list_batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_BATCH").is_some_and(|v| v == "1"))
+}
+
+pub(crate) static LIST_BATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIST_FLUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Flushes batched descriptor copies in one `CopyDescriptors` call.
+pub(crate) fn flush_copies(batch: &mut CopyBatch) {
+    if batch.copies.is_empty() {
+        return;
+    }
+    let Some(host) = host() else { return };
+    static STEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: a plain query.
+    let step = *STEP.get_or_init(|| unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) } as usize);
+    let mut dest_starts = Vec::with_capacity(batch.copies.len());
+    let mut dest_sizes: Vec<u32> = Vec::with_capacity(batch.copies.len());
+    for &(dst, _) in &batch.copies {
+        match (dest_starts.last(), dest_sizes.last_mut()) {
+            (Some(&D3D12_CPU_DESCRIPTOR_HANDLE { ptr }), Some(size)) if ptr + *size as usize * step == dst.ptr => *size += 1,
+            _ => {
+                dest_starts.push(dst);
+                dest_sizes.push(1);
+            }
+        }
+    }
+    let src_starts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = batch.copies.iter().map(|c| c.1).collect();
+    let ones = vec![1u32; src_starts.len()];
+    // SAFETY: slots of our heap and of this thread's, as `copy_from` takes them.
+    unsafe {
+        host.device.CopyDescriptors(
+            dest_starts.len() as u32,
+            dest_starts.as_ptr(),
+            Some(dest_sizes.as_ptr()),
+            src_starts.len() as u32,
+            src_starts.as_ptr(),
+            Some(ones.as_ptr()),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        )
+    };
+    LIST_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LIST_BATCHED.fetch_add(batch.copies.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    batch.copies.clear();
 }
 
 /// The descriptors a thread made for one recording of a list, by the record

@@ -17,8 +17,51 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Render-target binds in one presented frame that mark a world frame
+/// ([`unpaced_loading`]).
+const WORLD_TARGET_BINDS: u32 = 100;
+
+static TARGET_BINDS: AtomicU32 = AtomicU32::new(0);
+static LAST_TARGET_BINDS: AtomicU32 = AtomicU32::new(0);
+
+/// `VICTORY_LOAD_UNPACED=1` (off by default): while the title draws loading
+/// screens, logos and menus (frames that bind fewer than [`WORLD_TARGET_BINDS`]
+/// render targets), its frame waits end at once instead of sleeping to the
+/// title's 30 fps interval. World frames stay paced as before.
+pub(crate) fn unpaced_loading() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LOAD_UNPACED")
+            .is_some_and(|v| !matches!(v.to_string_lossy().trim(), "" | "0" | "false" | "off"));
+        if on {
+            tracing::info!("load unpaced: frame waits end at once on loading and menu frames (VICTORY_LOAD_UNPACED=1)");
+        }
+        on
+    })
+}
+
+/// Counts a render-target bind in the current frame (for [`unpaced_loading`]).
+pub(crate) fn note_render_targets() {
+    if unpaced_loading() {
+        TARGET_BINDS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Records the completed frame's render-target binds when presented.
+pub(crate) fn frame_presented() {
+    if unpaced_loading() {
+        LAST_TARGET_BINDS.store(TARGET_BINDS.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// Whether the last presented frame was a light loading/menu frame and
+/// `VICTORY_LOAD_UNPACED=1` is enabled.
+fn skip_pacing() -> bool {
+    unpaced_loading() && LAST_TARGET_BINDS.load(Ordering::Relaxed) < WORLD_TARGET_BINDS
+}
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
 
@@ -166,6 +209,19 @@ pub(crate) extern "system" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
+    // `VICTORY_LOAD_UNPACED=1`: loading and menu frames do not wait. No
+    // tick is taken, so pacing resumes from the clock once the world shows.
+    if skip_pacing() {
+        if origin {
+            let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+            pace::begun();
+            if !token.is_null() {
+                // SAFETY: checked non-null; the title passes its token.
+                unsafe { token.write(frame) };
+            }
+        }
+        return S_OK;
+    }
     let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
     // A blocking wait for an event that has happened since the last wait
